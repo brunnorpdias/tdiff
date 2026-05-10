@@ -52,7 +52,7 @@ tdiff today -a -I              # only additions, hiding terminal-status items
 | `-I` / `--ignore`  | Hide tasks in terminal statuses (`x`, `-`, `&`, `»`, `«`) |
 | `-D` / `--dupes`   | Duplicate finder for a single date |
 | `-t N` / `--offset N` | Compare anchor with anchor + N days (N nonzero, may be negative) |
-| `-w N` / `--week-offset N` | Compare anchor day with the Sun-Sat week N weeks away (N may be 0 or negative) |
+| `-w N` / `--week-offset N` | Compare anchor day with the Sun-Sat week N weeks away (N is any integer: negative, 0, or positive) |
 | `--no-color` | Disable colored output |
 | `--no-summary` | Suppress the summary line |
 
@@ -62,8 +62,19 @@ If no `-d/-a/-c/-s` is given, all types except `same` are shown.
 
 - Notes are read from `01 Daily/<YYYY-MM-DD>` via the `obsidian` CLI; `#routine` tasks are filtered out.
 - Project items (statuses `p`, `i`, `u`) are always excluded from output.
-- Within a single day — and within a week aggregation — duplicate task names are deduped via `STATUS_PRIORITY`: the highest-priority status wins, with ties resolved by the most recent occurrence.
 - Section suffixes (`task name - section`) are stripped before comparison so the same task under different daily sections still matches.
-- Fuzzy matching (Jaccard or shared-prefix at threshold 0.7) catches renamed/edited tasks.
 - Week aggregation uses **US Sun-Sat**, not ISO Mon-Sun. Internal label format: `%Y-W%U`.
 - For `-w`, sign controls display order: `N <= 0` puts the week on the left (older-or-same), `N > 0` puts the day on the left.
+
+### Deduplication
+
+A single unified predicate decides whether two task strings refer to the same logical task. It's used everywhere — within a day, across days in a week aggregation, and in the `-D` duplicate finder.
+
+Two tasks merge if **any** of these holds (after wikilink-path and trailing-punctuation normalization):
+
+1. Their token sets are identical (e.g. `derivables..` vs `derivables`).
+2. One token set is a strict subset of the other AND they share the same first word (e.g. `start imperial application` vs `start new imperial application`).
+
+Wikilink folder paths are stripped inside `[[...]]` so `[[01 Daily/2026-05-03#recensio|alias]]` and `[[2026-05-03#recensio|alias]]` are treated as the same link.
+
+When a cluster forms, the **canonical name** is the most recent day's wording (tie-break: longest), and the **winning status** is the highest `STATUS_PRIORITY` across the cluster (`x` > `-`/`#` > `!`/`*`/` ` > `/` > intra-day markers); status ties resolve to the latest day. The cross-note diff still uses Jaccard/prefix fuzzy matching at threshold 0.7 to label renamed tasks as "changed" rather than "added"+"deleted".

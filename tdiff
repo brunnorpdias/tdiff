@@ -34,28 +34,110 @@ STATUS_PRIORITY = {
     '&': 1, '«': 1, '»': 1, '>': 1, '=': 1, '~': 1,         # intra-day markers
 }
 
-def fetch(d):
+WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
+
+def _strip_wiki_path(m):
+    inner = m.group(1)
+    if '|' in inner:
+        target, alias = inner.split('|', 1)
+        return f'[[{target.rsplit("/", 1)[-1]}|{alias}]]'
+    return f'[[{inner.rsplit("/", 1)[-1]}]]'
+
+def normalize_wikilinks(s):
+    return WIKILINK_RE.sub(_strip_wiki_path, s)
+
+_PUNCT = ',.;:!?-—…'
+
+def _tokens(s):
+    out = []
+    for t in s.split():
+        t = t.lower().strip(_PUNCT)
+        if t:
+            out.append(t)
+    return out
+
+def is_same_task(a, b):
+    """Predicate: same logical task. Token-set equality, or strict subset sharing first word."""
+    ta, tb = _tokens(a), _tokens(b)
+    sa, sb = set(ta), set(tb)
+    if not sa or not sb:
+        return a == b
+    if sa == sb:
+        return True
+    if (sa < sb or sb < sa) and ta and tb and ta[0] == tb[0]:
+        return True
+    return False
+
+def _parse_lines(d, day_index):
+    """Yield (base, status, day_index) records from one daily note."""
     result = subprocess.run(
         f"obsidian tasks file='01 Daily/{d}' | rg -Fv '#routine'",
         shell=True, capture_output=True, text=True
     )
-    tasks, order, occurrences = {}, [], {}
     for line in result.stdout.splitlines():
         m = re.match(r'^- (\[.\]) (.+)$', line.rstrip())
-        if m:
-            status, full_name = m.group(1), m.group(2)
-            full_name = full_name.replace('\\[', '[').replace('\\]', ']')
-            base = strip_section_suffix(full_name)
-            base = re.sub(r'^\(new\)\s*', '', base, flags=re.IGNORECASE)
-            if base not in occurrences:
-                occurrences[base] = []
-                order.append(base)
-            occurrences[base].append(status)
-            new_pri = STATUS_PRIORITY.get(status[1], 0)
-            old_pri = STATUS_PRIORITY.get(tasks[base][1], 0) if base in tasks else -1
-            if new_pri >= old_pri:
-                tasks[base] = status
+        if not m:
+            continue
+        status, full_name = m.group(1), m.group(2)
+        full_name = full_name.replace('\\[', '[').replace('\\]', ']')
+        full_name = normalize_wikilinks(full_name)
+        base = strip_section_suffix(full_name)
+        base = re.sub(r'^\(new\)\s*', '', base, flags=re.IGNORECASE)
+        yield base, status, day_index
+
+def cluster_records(records):
+    """Cluster records by is_same_task using union-find. Returns list of clusters
+    (each a list of records) in first-seen order of their root base."""
+    bases_in_order, seen = [], set()
+    for base, _, _ in records:
+        if base not in seen:
+            seen.add(base)
+            bases_in_order.append(base)
+
+    parent = {b: b for b in bases_in_order}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i, a in enumerate(bases_in_order):
+        for b in bases_in_order[i + 1:]:
+            if is_same_task(a, b):
+                union(a, b)
+
+    by_root = {}
+    for rec in records:
+        by_root.setdefault(find(rec[0]), []).append(rec)
+
+    clusters, emitted = [], set()
+    for b in bases_in_order:
+        r = find(b)
+        if r in emitted:
+            continue
+        emitted.add(r)
+        clusters.append(by_root[r])
+    return clusters
+
+def materialize(clusters):
+    """Reduce each cluster to one (canonical_base, winning_status) pair."""
+    tasks, order, occurrences = {}, [], {}
+    for members in clusters:
+        # Canonical: most recent day; tie-break by longest base.
+        canonical = max(members, key=lambda r: (r[2], len(r[0])))[0]
+        # Winning status: highest STATUS_PRIORITY; tie-break by latest day.
+        winning = max(members, key=lambda r: (STATUS_PRIORITY.get(r[1][1], 0), r[2]))[1]
+        order.append(canonical)
+        tasks[canonical] = winning
+        occurrences[canonical] = [s for _, s, _ in members]
     return tasks, order, occurrences
+
+def fetch(d):
+    return materialize(cluster_records(list(_parse_lines(d, 0))))
 
 def week_span(d):
     """Return (sunday, saturday, label) for the US-format Sun-Sat week containing d."""
@@ -68,21 +150,11 @@ def week_span(d):
 
 def fetch_week(sunday):
     """Group 7 daily notes Sun..Sat into one virtual note. Same shape as fetch()."""
-    tasks, order, occurrences = {}, [], {}
+    records = []
     for i in range(7):
         d = (sunday + timedelta(days=i)).isoformat()
-        day_tasks, day_order, day_occ = fetch(d)
-        for base in day_order:
-            status = day_tasks[base]
-            if base not in occurrences:
-                occurrences[base] = []
-                order.append(base)
-            occurrences[base].extend(day_occ[base])
-            new_pri = STATUS_PRIORITY.get(status[1], 0)
-            old_pri = STATUS_PRIORITY.get(tasks[base][1], 0) if base in tasks else -1
-            if new_pri >= old_pri:
-                tasks[base] = status
-    return tasks, order, occurrences
+        records.extend(_parse_lines(d, i))
+    return materialize(cluster_records(records))
 
 def jaccard(a, b):
     sa, sb = set(a.lower().split()), set(b.lower().split())
@@ -134,7 +206,7 @@ parser.add_argument('-I', '--ignore',     action='store_true',
 parser.add_argument('-t', '--offset',     type=str, default=None,
                     help='compare anchor (date_a) with date_a + N days; N may be negative')
 parser.add_argument('-w', '--week-offset', type=str, default=None,
-                    help='compare anchor (date_a) with the Sun-Sat week N weeks away; N may be negative; 0 allowed')
+                    help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
 
@@ -249,43 +321,29 @@ RESET  = '\033[0m'  if use_color else ''
 # ── Dupes mode ───────────────────────────────────────────────────────────────
 
 if args.dupes:
-    tasks, order, occurrences = fetch(date_a)
+    clusters = cluster_records(list(_parse_lines(date_a, 0)))
 
-    exact = {
-        base: sts for base, sts in occurrences.items()
-        if len(sts) > 1 and tasks[base][1] not in ignore_set
-    }
-
-    # Fuzzy near-dupes: check all remaining pairs
-    names = [n for n in order if tasks[n][1] not in ignore_set]
-    used = set()
-    fuzzy = []
-    for i, a in enumerate(names):
-        if a in used:
+    found = False
+    for members in clusters:
+        if len(members) <= 1:
             continue
-        candidates = [n for n in names[i + 1:] if n not in used]
-        match = best_match(a, candidates)
-        if match:
-            used.add(a)
-            used.add(match)
-            fuzzy.append((a, match))
-
-    found = bool(exact or fuzzy)
-
-    if exact:
-        print(f"{YELLOW}Exact duplicates:{RESET}")
-        for base in sorted(exact):
-            sts = exact[base]
-            statuses = ', '.join(sts)
-            print(f"  {RED}!! {base}{RESET}  ({len(sts)}×  {statuses})")
-
-    if fuzzy:
-        if exact:
+        winning = max(members, key=lambda r: (STATUS_PRIORITY.get(r[1][1], 0), r[2]))[1]
+        if winning[1] in ignore_set:
+            continue
+        # Group records by base within the cluster
+        by_base = {}
+        for base, status, _ in members:
+            by_base.setdefault(base, []).append(status)
+        if not found:
+            print(f"{YELLOW}Duplicates:{RESET}")
+            found = True
+        else:
             print()
-        print(f"{YELLOW}Near-duplicates:{RESET}")
-        for a, b in fuzzy:
-            print(f"  {YELLOW}~~ {tasks[a]}  {a}{RESET}")
-            print(f"     {tasks[b]}  {b}")
+        marker = RED if len(by_base) == 1 else YELLOW
+        sigil = '!!' if len(by_base) == 1 else '~~'
+        for base, sts in by_base.items():
+            statuses = ', '.join(sts)
+            print(f"  {marker}{sigil} {base}{RESET}  ({len(sts)}×  {statuses})")
 
     if not found:
         print(f"{DIM}No duplicates found in {date_a}.{RESET}")
