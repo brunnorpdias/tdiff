@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+import sys, re, subprocess, difflib, argparse
+from datetime import date, timedelta
+
+JACCARD_THRESHOLD = 0.7
+PREFIX_THRESHOLD  = 0.7
+
+_SEP_RE = re.compile(r' [-–—] ')  # hyphen, en-dash, em-dash
+
+def strip_section_suffix(s):
+    """Remove trailing ' – ...' only when the dash is outside of [...] brackets."""
+    depth = 0
+    for i, c in enumerate(s):
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == ' ' and _SEP_RE.match(s, i):
+            return s[:i].strip()
+    return s.strip()
+
+# Statuses hidden when -I is active
+DEFAULT_IGNORE   = {'x', '-', '&', '»', '«'}
+# Project items are structural — always excluded from all output
+PROJECT_STATUSES = {'p', 'i', 'u'}
+
+# Dedup priority: when a task appears multiple times in a file, the status with
+# the highest priority wins. Ties break by document order (latest wins).
+STATUS_PRIORITY = {
+    'x':                                                5,  # done (sticky)
+    '-': 4, '#': 4,                                         # cancelled, blocked
+    '!': 3, '*': 3, ' ': 3,                                 # urgent, important, pending
+    '/':                                                2,  # partial
+    '&': 1, '«': 1, '»': 1, '>': 1, '=': 1, '~': 1,         # intra-day markers
+}
+
+def fetch(d):
+    result = subprocess.run(
+        f"obsidian tasks file='01 Daily/{d}' | rg -Fv '#routine'",
+        shell=True, capture_output=True, text=True
+    )
+    tasks, order, occurrences = {}, [], {}
+    for line in result.stdout.splitlines():
+        m = re.match(r'^- (\[.\]) (.+)$', line.rstrip())
+        if m:
+            status, full_name = m.group(1), m.group(2)
+            full_name = full_name.replace('\\[', '[').replace('\\]', ']')
+            base = strip_section_suffix(full_name)
+            base = re.sub(r'^\(new\)\s*', '', base, flags=re.IGNORECASE)
+            if base not in occurrences:
+                occurrences[base] = []
+                order.append(base)
+            occurrences[base].append(status)
+            new_pri = STATUS_PRIORITY.get(status[1], 0)
+            old_pri = STATUS_PRIORITY.get(tasks[base][1], 0) if base in tasks else -1
+            if new_pri >= old_pri:
+                tasks[base] = status
+    return tasks, order, occurrences
+
+def week_span(d):
+    """Return (sunday, saturday, label) for the US-format Sun-Sat week containing d."""
+    if isinstance(d, str):
+        d = date.fromisoformat(d)
+    days_back = (d.weekday() + 1) % 7   # Mon=0..Sun=6 -> Sun=0
+    sun = d - timedelta(days=days_back)
+    sat = sun + timedelta(days=6)
+    return sun, sat, sun.strftime('%Y-W%U')
+
+def fetch_week(sunday):
+    """Group 7 daily notes Sun..Sat into one virtual note. Same shape as fetch()."""
+    tasks, order, occurrences = {}, [], {}
+    for i in range(7):
+        d = (sunday + timedelta(days=i)).isoformat()
+        day_tasks, day_order, day_occ = fetch(d)
+        for base in day_order:
+            status = day_tasks[base]
+            if base not in occurrences:
+                occurrences[base] = []
+                order.append(base)
+            occurrences[base].extend(day_occ[base])
+            new_pri = STATUS_PRIORITY.get(status[1], 0)
+            old_pri = STATUS_PRIORITY.get(tasks[base][1], 0) if base in tasks else -1
+            if new_pri >= old_pri:
+                tasks[base] = status
+    return tasks, order, occurrences
+
+def jaccard(a, b):
+    sa, sb = set(a.lower().split()), set(b.lower().split())
+    if not sa and not sb:
+        return 1.0
+    return len(sa & sb) / len(sa | sb)
+
+def prefix_sim(a, b):
+    matcher = difflib.SequenceMatcher(None, a.lower(), b.lower())
+    blocks = matcher.get_matching_blocks()
+    if not blocks:
+        return 0.0
+    first = blocks[0]
+    if first.a != 0 or first.b != 0:
+        return 0.0
+    return (2 * first.size) / (len(a) + len(b))
+
+def best_match(name, candidates):
+    best, best_score = None, 0
+    for c in candidates:
+        j = jaccard(name, c)
+        p = prefix_sim(name, c)
+        score = max(j, p)
+        if score > best_score:
+            best, best_score = c, score
+    if best and best_score >= JACCARD_THRESHOLD:
+        return best
+    return None
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(
+    prog='tdiff',
+    description='Compare tasks between two Obsidian daily notes.',
+    epilog=(
+        'Dates accept YYYY-MM-DD, "today", "yesterday", "0" (today), or -N (e.g. -1 for yesterday). '
+        'Use -t N to compare the anchor (date_a) with date_a + N days; N may be negative.'
+    ),
+)
+parser.add_argument('date_a', help='first (older) date')
+parser.add_argument('date_b', nargs='?', default=None, help='second (newer) date (omit with --dupes)')
+parser.add_argument('-d', '--deleted',    action='store_true', help='show deleted tasks')
+parser.add_argument('-a', '--added',      action='store_true', help='show added tasks')
+parser.add_argument('-c', '--changed',    action='store_true', help='show changed tasks')
+parser.add_argument('-s', '--same',       action='store_true', help='show unchanged tasks')
+parser.add_argument('-D', '--dupes',      action='store_true', help='find duplicate tasks in a single date')
+parser.add_argument('-I', '--ignore',     action='store_true',
+                    help='hide tasks in terminal statuses (done, cancelled, overrun, postponed, advanced)')
+parser.add_argument('-t', '--offset',     type=str, default=None,
+                    help='compare anchor (date_a) with date_a + N days; N may be negative')
+parser.add_argument('-w', '--week-offset', type=str, default=None,
+                    help='compare anchor (date_a) with the Sun-Sat week N weeks away; N may be negative; 0 allowed')
+parser.add_argument('--no-color',         action='store_true', help='disable colored output')
+parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
+
+# argparse chokes on bare negative numbers like -1 before we can process them;
+# intercept them and turn them into a safe token first.
+raw = sys.argv[1:]
+safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
+args = parser.parse_args(safe)
+
+def restore(s):
+    if s.startswith('__NEG__'):
+        return '-' + s[7:]
+    return s
+
+_ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
+_NEG_RE = re.compile(r'-(\d+)')
+
+def resolve_date(s):
+    if s == 'today' or s == '0':
+        return date.today().isoformat()
+    if s == 'yesterday':
+        return (date.today() - timedelta(days=1)).isoformat()
+    m = _NEG_RE.fullmatch(s)
+    if m:
+        n = int(m.group(1))
+        if n < 1:
+            parser.error(f"invalid date: {s!r} (use 0 for today)")
+        return (date.today() - timedelta(days=n)).isoformat()
+    if _ISO_RE.fullmatch(s):
+        try:
+            return date.fromisoformat(s).isoformat()
+        except ValueError:
+            parser.error(f"invalid date: {s!r}")
+    parser.error(
+        f"invalid date: {s!r} "
+        f"(expected YYYY-MM-DD, 'today', 'yesterday', '0', or '-N')"
+    )
+
+offset = None
+if args.offset is not None:
+    try:
+        offset = int(restore(args.offset))
+    except ValueError:
+        parser.error(f"--offset expects an integer, got {args.offset!r}")
+
+week_offset = None
+if args.week_offset is not None:
+    try:
+        week_offset = int(restore(args.week_offset))
+    except ValueError:
+        parser.error(f"--week-offset expects an integer, got {args.week_offset!r}")
+
+date_a = resolve_date(restore(args.date_a))
+
+# side_a / side_b: ('day', date_str) or ('week', sunday_date)
+side_a = side_b = None
+
+if offset is not None:
+    if args.date_b is not None:
+        parser.error("cannot combine --offset with an explicit date_b")
+    if args.dupes:
+        parser.error("cannot combine --offset with --dupes")
+    if week_offset is not None:
+        parser.error("cannot combine --offset with --week-offset")
+    if offset == 0:
+        parser.error("--offset must be non-zero")
+    other = (date.fromisoformat(date_a) + timedelta(days=offset)).isoformat()
+    # Keep chronological order: anchor first when offset>0, anchor second when <0.
+    if offset > 0:
+        date_b = other
+    else:
+        date_b = date_a
+        date_a = other
+    side_a = ('day', date_a)
+    side_b = ('day', date_b)
+elif week_offset is not None:
+    if args.date_b is not None:
+        parser.error("cannot combine --week-offset with an explicit date_b")
+    if args.dupes:
+        parser.error("cannot combine --week-offset with --dupes")
+    target_day = date.fromisoformat(date_a) + timedelta(days=week_offset * 7)
+    sun, _, _ = week_span(target_day)
+    # week_offset <= 0 -> week is older-or-same -> week on left, day on right.
+    # week_offset >  0 -> day on left, week on right.
+    if week_offset <= 0:
+        side_a = ('week', sun)
+        side_b = ('day', date_a)
+    else:
+        side_a = ('day', date_a)
+        side_b = ('week', sun)
+    date_b = sun.isoformat()  # kept for any legacy reference; not used by load()
+elif args.date_b is not None:
+    date_b = resolve_date(restore(args.date_b))
+    side_a = ('day', date_a)
+    side_b = ('day', date_b)
+elif not args.dupes:
+    parser.error("date_b is required (or use --dupes, --offset N, or --week-offset N)")
+else:
+    date_b = None
+
+ignore_set = PROJECT_STATUSES | (DEFAULT_IGNORE if args.ignore else set())
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+use_color = not args.no_color and sys.stdout.isatty()
+RED    = '\033[31m' if use_color else ''
+GREEN  = '\033[32m' if use_color else ''
+YELLOW = '\033[33m' if use_color else ''
+DIM    = '\033[2m'  if use_color else ''
+RESET  = '\033[0m'  if use_color else ''
+
+# ── Dupes mode ───────────────────────────────────────────────────────────────
+
+if args.dupes:
+    tasks, order, occurrences = fetch(date_a)
+
+    exact = {
+        base: sts for base, sts in occurrences.items()
+        if len(sts) > 1 and tasks[base][1] not in ignore_set
+    }
+
+    # Fuzzy near-dupes: check all remaining pairs
+    names = [n for n in order if tasks[n][1] not in ignore_set]
+    used = set()
+    fuzzy = []
+    for i, a in enumerate(names):
+        if a in used:
+            continue
+        candidates = [n for n in names[i + 1:] if n not in used]
+        match = best_match(a, candidates)
+        if match:
+            used.add(a)
+            used.add(match)
+            fuzzy.append((a, match))
+
+    found = bool(exact or fuzzy)
+
+    if exact:
+        print(f"{YELLOW}Exact duplicates:{RESET}")
+        for base in sorted(exact):
+            sts = exact[base]
+            statuses = ', '.join(sts)
+            print(f"  {RED}!! {base}{RESET}  ({len(sts)}×  {statuses})")
+
+    if fuzzy:
+        if exact:
+            print()
+        print(f"{YELLOW}Near-duplicates:{RESET}")
+        for a, b in fuzzy:
+            print(f"  {YELLOW}~~ {tasks[a]}  {a}{RESET}")
+            print(f"     {tasks[b]}  {b}")
+
+    if not found:
+        print(f"{DIM}No duplicates found in {date_a}.{RESET}")
+
+    sys.exit(0)
+
+# ── Diff ──────────────────────────────────────────────────────────────────────
+
+def load(side):
+    kind, key = side
+    return fetch_week(key) if kind == 'week' else fetch(key)
+
+a_tasks, a_order, _ = load(side_a)
+b_tasks, b_order, _ = load(side_b)
+
+a_names = set(a_tasks)
+b_names = set(b_tasks)
+
+# Types: 0=deleted, 1=added, 2=changed, 3=same
+# Tuples: (sort_key, type, display_string, eff_status_char)
+# eff_status_char: B's status for added/changed/same; A's status for deleted.
+output = []
+
+used_b = set()
+used_a = set()
+
+# Pass 1: exact name matches
+for name in a_names & b_names:
+    used_a.add(name)
+    used_b.add(name)
+    if a_tasks[name] != b_tasks[name]:
+        eff = b_tasks[name][1]
+        output.append((name, 2, f"{YELLOW}~~ {a_tasks[name]} → {b_tasks[name]}  {name}{RESET}", eff))
+    else:
+        eff = a_tasks[name][1]
+        output.append((name, 3, f"{DIM}== {a_tasks[name]}  {name}{RESET}", eff))
+
+# Pass 2: fuzzy match remaining
+remaining_a = [n for n in a_order if n not in used_a]
+remaining_b = [n for n in b_order if n not in used_b]
+
+for a_name in remaining_a:
+    match = best_match(a_name, [n for n in remaining_b if n not in used_b])
+    if match:
+        used_a.add(a_name)
+        used_b.add(match)
+        a_s, b_s = a_tasks[a_name], b_tasks[match]
+        eff = b_s[1]
+        if a_name == match:
+            output.append((a_name, 2, f"{YELLOW}~~ {a_s} → {b_s}  {a_name}{RESET}", eff))
+        else:
+            output.append((a_name, 2, f"{YELLOW}~~ {a_s} {a_name} → {b_s} {match}{RESET}", eff))
+    else:
+        eff = a_tasks[a_name][1]
+        output.append((a_name, 0, f"{RED}-- {a_tasks[a_name]}  {a_name}{RESET}", eff))
+
+for b_name in remaining_b:
+    if b_name not in used_b:
+        eff = b_tasks[b_name][1]
+        output.append((b_name, 1, f"{GREEN}++ {b_tasks[b_name]}  {b_name}{RESET}", eff))
+
+output.sort(key=lambda x: (x[0].lower(), x[1]))
+
+# ── Filter & print ────────────────────────────────────────────────────────────
+
+show_all = not any([args.deleted, args.added, args.changed, args.same])
+type_enabled = {0: args.deleted, 1: args.added, 2: args.changed, 3: args.same}
+
+counts = {0: 0, 1: 0, 2: 0, 3: 0}
+for _, typ, line, eff in output:
+    if eff in ignore_set:
+        continue
+    counts[typ] += 1
+    if show_all:
+        if typ != 3:   # hide same by default (legacy behavior)
+            print(line)
+    elif type_enabled[typ]:
+        print(line)
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+if not args.no_summary:
+    parts = [
+        f"{GREEN}{counts[1]} added{RESET}",
+        f"{RED}{counts[0]} deleted{RESET}",
+        f"{YELLOW}{counts[2]} changed{RESET}",
+        f"{DIM}{counts[3]} same{RESET}",
+    ]
+    print('  ' + f"  {DIM}·{RESET}  ".join(parts))
