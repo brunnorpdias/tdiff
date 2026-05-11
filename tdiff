@@ -148,11 +148,14 @@ def week_span(d):
     sat = sun + timedelta(days=6)
     return sun, sat, sun.strftime('%Y-W%U')
 
-def fetch_week(sunday):
-    """Group 7 daily notes Sun..Sat into one virtual note. Same shape as fetch()."""
+def fetch_week(sunday, exclude=None):
+    """Group 7 daily notes Sun..Sat into one virtual note. Same shape as fetch().
+    If `exclude` (ISO date string) is given, that day is skipped from the aggregation."""
     records = []
     for i in range(7):
         d = (sunday + timedelta(days=i)).isoformat()
+        if d == exclude:
+            continue
         records.extend(_parse_lines(d, i))
     return materialize(cluster_records(records))
 
@@ -289,14 +292,17 @@ elif week_offset is not None:
         parser.error("cannot combine --week-offset with --dupes")
     target_day = date.fromisoformat(date_a) + timedelta(days=week_offset * 7)
     sun, _, _ = week_span(target_day)
+    # When week_offset == 0 the anchor day is inside the target week; exclude it
+    # from the aggregation so the diff is "anchor vs the rest of its week".
+    week_key = (sun, date_a) if week_offset == 0 else (sun, None)
     # week_offset <= 0 -> week is older-or-same -> week on left, day on right.
     # week_offset >  0 -> day on left, week on right.
     if week_offset <= 0:
-        side_a = ('week', sun)
+        side_a = ('week', week_key)
         side_b = ('day', date_a)
     else:
         side_a = ('day', date_a)
-        side_b = ('week', sun)
+        side_b = ('week', week_key)
     date_b = sun.isoformat()  # kept for any legacy reference; not used by load()
 elif args.date_b is not None:
     date_b = resolve_date(restore(args.date_b))
@@ -354,7 +360,10 @@ if args.dupes:
 
 def load(side):
     kind, key = side
-    return fetch_week(key) if kind == 'week' else fetch(key)
+    if kind == 'week':
+        sun, exclude = key
+        return fetch_week(sun, exclude=exclude)
+    return fetch(key)
 
 a_tasks, a_order, _ = load(side_a)
 b_tasks, b_order, _ = load(side_b)
