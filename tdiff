@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import sys, re, subprocess, difflib, argparse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 JACCARD_THRESHOLD = 0.7
 PREFIX_THRESHOLD  = 0.7
@@ -27,10 +27,10 @@ PROJECT_STATUSES = {'p', 'i', 'u'}
 # Dedup priority: when a task appears multiple times in a file, the status with
 # the highest priority wins. Ties break by document order (latest wins).
 STATUS_PRIORITY = {
-    'x':                                                5,  # done (sticky)
-    '-': 4, '#': 4,                                         # cancelled, blocked
-    '!': 3, '*': 3, ' ': 3,                                 # urgent, important, pending
-    '/':                                                2,  # partial
+    'x': 5,                                                 # done (sticky)
+    '-': 4,                                                 # cancelled
+    '!': 3, '*': 3, ' ': 3, '#': 3,                         # urgent, important, no-status, blocked
+    '/': 2,                                                 # partial
     '&': 1, '«': 1, '»': 1, '>': 1, '=': 1, '~': 1,         # intra-day markers
 }
 
@@ -68,10 +68,10 @@ def is_same_task(a, b):
         return True
     return False
 
-def _parse_lines(d, day_index):
-    """Yield (base, status, day_index) records from one daily note."""
+def _parse_obsidian(file_path, day_index):
+    """Yield (base, status, day_index) records from one obsidian file path."""
     result = subprocess.run(
-        f"obsidian tasks file='01 Daily/{d}' | rg -Fv '#routine'",
+        f"obsidian tasks file='{file_path}' | rg -Fv '#routine'",
         shell=True, capture_output=True, text=True
     )
     for line in result.stdout.splitlines():
@@ -84,6 +84,14 @@ def _parse_lines(d, day_index):
         base = strip_section_suffix(full_name)
         base = re.sub(r'^\(new\)\s*', '', base, flags=re.IGNORECASE)
         yield base, status, day_index
+
+def _parse_lines(d, day_index):
+    """Yield (base, status, day_index) records from one daily note."""
+    yield from _parse_obsidian(f'01 Daily/{d}', day_index)
+
+def _parse_weekly_file(week_label, day_index):
+    """Yield (base, status, day_index) records from one weekly planning file."""
+    yield from _parse_obsidian(f'02 Weekly/{week_label}', day_index)
 
 def cluster_records(records):
     """Cluster records by is_same_task using union-find. Returns list of clusters
@@ -130,7 +138,7 @@ def materialize(clusters):
         # Canonical: most recent day; tie-break by longest base.
         canonical = max(members, key=lambda r: (r[2], len(r[0])))[0]
         # Winning status: highest STATUS_PRIORITY; tie-break by latest day.
-        winning = max(members, key=lambda r: (STATUS_PRIORITY.get(r[1][1], 0), r[2]))[1]
+        winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
         order.append(canonical)
         tasks[canonical] = winning
         occurrences[canonical] = [s for _, s, _ in members]
@@ -146,18 +154,28 @@ def week_span(d):
     days_back = (d.weekday() + 1) % 7   # Mon=0..Sun=6 -> Sun=0
     sun = d - timedelta(days=days_back)
     sat = sun + timedelta(days=6)
-    return sun, sat, sun.strftime('%Y-W%U')
+    jan1 = date(sun.year, 1, 1)
+    days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
+    week_num = ((sun - jan1).days + days_back) // 7 + 1
+    return sun, sat, f"{sun.year}-W{week_num:02d}"
 
-def fetch_week(sunday, exclude=None):
-    """Group 7 daily notes Sun..Sat into one virtual note. Same shape as fetch().
-    If `exclude` (ISO date string) is given, that day is skipped from the aggregation."""
+def fetch_week(sunday, exclude=None, exclude_weekly_file=False):
+    """Group 7 daily notes Sun..Sat plus weekly planning file into one virtual note.
+    `exclude` (ISO date string): skip that day. `exclude_weekly_file`: omit the weekly file."""
+    _, _, week_label = week_span(sunday)
     records = []
     for i in range(7):
         d = (sunday + timedelta(days=i)).isoformat()
         if d == exclude:
             continue
         records.extend(_parse_lines(d, i))
+    if not exclude_weekly_file:
+        records.extend(_parse_weekly_file(week_label, day_index=0))
     return materialize(cluster_records(records))
+
+def fetch_weekly_file(week_label):
+    """Fetch and deduplicate tasks from a single weekly planning file."""
+    return materialize(cluster_records(list(_parse_weekly_file(week_label, day_index=0))))
 
 def jaccard(a, b):
     sa, sb = set(a.lower().split()), set(b.lower().split())
@@ -193,8 +211,9 @@ parser = argparse.ArgumentParser(
     prog='tdiff',
     description='Compare tasks between two Obsidian daily notes.',
     epilog=(
-        'Dates accept YYYY-MM-DD, "today", "yesterday", "0" (today), or -N (e.g. -1 for yesterday). '
-        'Use -t N to compare the anchor (date_a) with date_a + N days; N may be negative.'
+        'Dates accept YYYY-MM-DD, "today", "yesterday", "0" (today), -N (e.g. -1 for yesterday), '
+        'or w## / w2026-W## for a weekly planning file (e.g. w20 = week 20 of the current year). '
+        'Use -t N to compare the anchor with anchor + N days; N may be negative.'
     ),
 )
 parser.add_argument('date_a', help='first (older) date')
@@ -224,8 +243,10 @@ def restore(s):
         return '-' + s[7:]
     return s
 
-_ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
-_NEG_RE = re.compile(r'-(\d+)')
+_ISO_RE       = re.compile(r'\d{4}-\d{2}-\d{2}')
+_NEG_RE       = re.compile(r'-(\d+)')
+_WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
+_WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
 
 def resolve_date(s):
     if s == 'today' or s == '0':
@@ -245,8 +266,25 @@ def resolve_date(s):
             parser.error(f"invalid date: {s!r}")
     parser.error(
         f"invalid date: {s!r} "
-        f"(expected YYYY-MM-DD, 'today', 'yesterday', '0', or '-N')"
+        f"(expected YYYY-MM-DD, 'today', 'yesterday', '0', '-N', or 'w##')"
     )
+
+def resolve_week_label(s):
+    """Return 'YYYY-W##' if s is a w## specifier, else None."""
+    m = _WEEK_FULL_RE.fullmatch(s)
+    if m:
+        return m.group(1)
+    m = _WEEK_SHORT_RE.fullmatch(s)
+    if m:
+        return f'{date.today().year}-W{int(m.group(1)):02d}'
+    return None
+
+def _week_label_to_sunday(week_label):
+    """Convert 'YYYY-W##' (US convention: week 1 contains Jan 1, weeks start Sunday)."""
+    year, week_num = int(week_label[:4]), int(week_label[6:])
+    jan1 = date(year, 1, 1)
+    days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
+    return jan1 - timedelta(days=days_back) + timedelta(weeks=week_num - 1)
 
 offset = None
 if args.offset is not None:
@@ -262,12 +300,17 @@ if args.week_offset is not None:
     except ValueError:
         parser.error(f"--week-offset expects an integer, got {args.week_offset!r}")
 
-date_a = resolve_date(restore(args.date_a))
+raw_a = restore(args.date_a)
+raw_b = restore(args.date_b) if args.date_b is not None else None
+week_label_a = resolve_week_label(raw_a)
+week_label_b = resolve_week_label(raw_b) if raw_b is not None else None
 
-# side_a / side_b: ('day', date_str) or ('week', sunday_date)
+# side_a / side_b: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
 side_a = side_b = None
 
 if offset is not None:
+    if week_label_a:
+        parser.error("--offset mode does not support week specifiers (w##)")
     if args.date_b is not None:
         parser.error("cannot combine --offset with an explicit date_b")
     if args.dupes:
@@ -276,6 +319,7 @@ if offset is not None:
         parser.error("cannot combine --offset with --week-offset")
     if offset == 0:
         parser.error("--offset must be non-zero")
+    date_a = resolve_date(raw_a)
     other = (date.fromisoformat(date_a) + timedelta(days=offset)).isoformat()
     # Keep chronological order: anchor first when offset>0, anchor second when <0.
     if offset > 0:
@@ -290,28 +334,47 @@ elif week_offset is not None:
         parser.error("cannot combine --week-offset with an explicit date_b")
     if args.dupes:
         parser.error("cannot combine --week-offset with --dupes")
-    target_day = date.fromisoformat(date_a) + timedelta(days=week_offset * 7)
+    # anchor may be a day or a weekly file; both give an anchor day for offset math
+    if week_label_a:
+        anchor_sun = _week_label_to_sunday(week_label_a)
+        anchor_day_str = anchor_sun.isoformat()
+        anchor_side = ('weekly_file', week_label_a)
+    else:
+        date_a = resolve_date(raw_a)
+        anchor_day_str = date_a
+        anchor_side = ('day', date_a)
+    target_day = date.fromisoformat(anchor_day_str) + timedelta(days=week_offset * 7)
     sun, _, _ = week_span(target_day)
-    # When week_offset == 0 the anchor day is inside the target week; exclude it
-    # from the aggregation so the diff is "anchor vs the rest of its week".
-    week_key = (sun, date_a) if week_offset == 0 else (sun, None)
-    # week_offset <= 0 -> week is older-or-same -> week on left, day on right.
-    # week_offset >  0 -> day on left, week on right.
+    # When week_offset == 0 the anchor is inside the target week; exclude it from
+    # the aggregation so the diff is "anchor vs the rest of its week".
+    if week_offset == 0:
+        if week_label_a:
+            # weekly file is the anchor — exclude it from the agg side, keep all daily notes
+            week_key = (sun, None, True)
+        else:
+            # day is the anchor — exclude that day from the agg side
+            week_key = (sun, anchor_day_str, False)
+    else:
+        week_key = (sun, None, False)
+    # week_offset <= 0 -> week is older-or-same -> week on left, anchor on right.
+    # week_offset >  0 -> anchor on left, week on right.
     if week_offset <= 0:
         side_a = ('week', week_key)
-        side_b = ('day', date_a)
+        side_b = anchor_side
     else:
-        side_a = ('day', date_a)
+        side_a = anchor_side
         side_b = ('week', week_key)
     date_b = sun.isoformat()  # kept for any legacy reference; not used by load()
 elif args.date_b is not None:
-    date_b = resolve_date(restore(args.date_b))
-    side_a = ('day', date_a)
-    side_b = ('day', date_b)
+    side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
+    side_b = ('weekly_file', week_label_b) if week_label_b else ('day', resolve_date(raw_b))
+    date_b = raw_b
 elif not args.dupes:
     parser.error("date_b is required (or use --dupes, --offset N, or --week-offset N)")
 else:
+    # dupes mode — anchor may be a day or a weekly file
     date_b = None
+    side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
 
 ignore_set = PROJECT_STATUSES | (DEFAULT_IGNORE if args.ignore else set())
 
@@ -327,13 +390,20 @@ RESET  = '\033[0m'  if use_color else ''
 # ── Dupes mode ───────────────────────────────────────────────────────────────
 
 if args.dupes:
-    clusters = cluster_records(list(_parse_lines(date_a, 0)))
+    _kind, _key = side_a
+    if _kind == 'weekly_file':
+        _raw_records = list(_parse_weekly_file(_key, day_index=0))
+        _label = _key
+    else:
+        _raw_records = list(_parse_lines(_key, 0))
+        _label = _key
+    clusters = cluster_records(_raw_records)
 
     found = False
     for members in clusters:
         if len(members) <= 1:
             continue
-        winning = max(members, key=lambda r: (STATUS_PRIORITY.get(r[1][1], 0), r[2]))[1]
+        winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
         if winning[1] in ignore_set:
             continue
         # Group records by base within the cluster
@@ -352,7 +422,7 @@ if args.dupes:
             print(f"  {marker}{sigil} {base}{RESET}  ({len(sts)}×  {statuses})")
 
     if not found:
-        print(f"{DIM}No duplicates found in {date_a}.{RESET}")
+        print(f"{DIM}No duplicates found in {_label}.{RESET}")
 
     sys.exit(0)
 
@@ -361,8 +431,10 @@ if args.dupes:
 def load(side):
     kind, key = side
     if kind == 'week':
-        sun, exclude = key
-        return fetch_week(sun, exclude=exclude)
+        sun, exclude_day, exclude_wf = key
+        return fetch_week(sun, exclude=exclude_day, exclude_weekly_file=exclude_wf)
+    if kind == 'weekly_file':
+        return fetch_weekly_file(key)
     return fetch(key)
 
 a_tasks, a_order, _ = load(side_a)
