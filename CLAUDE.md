@@ -47,6 +47,7 @@ The script processes tasks in this pipeline:
 |------|--------|
 | `-t N` | Compare anchor vs anchor ± N days |
 | `-w N` | Compare anchor vs Sun-Sat week N weeks away |
+| `-W` | With `-w`, exclude the `02 Weekly/YYYY-W##` planning file from the aggregation |
 | `-D` | Find duplicates within a single date |
 | `-d/-a/-c/-s` | Show deleted/added/changed/same tasks |
 | `-I` | Hide terminal-status items (`x`, `-`, `&`, `»`, `«`) |

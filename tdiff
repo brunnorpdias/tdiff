@@ -229,6 +229,8 @@ parser.add_argument('-t', '--offset',     type=str, default=None,
                     help='compare anchor (date_a) with date_a + N days; N may be negative')
 parser.add_argument('-w', '--week-offset', type=str, default=None,
                     help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
+parser.add_argument('-W', '--no-weekly',  action='store_true',
+                    help='exclude the 02 Weekly/YYYY-W## planning file from -w aggregation')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
 
@@ -300,6 +302,9 @@ if args.week_offset is not None:
     except ValueError:
         parser.error(f"--week-offset expects an integer, got {args.week_offset!r}")
 
+if args.no_weekly and args.week_offset is None:
+    parser.error("--no-weekly only applies to -w/--week-offset aggregation")
+
 raw_a = restore(args.date_a)
 raw_b = restore(args.date_b) if args.date_b is not None else None
 week_label_a = resolve_week_label(raw_a)
@@ -353,9 +358,9 @@ elif week_offset is not None:
             week_key = (sun, None, True)
         else:
             # day is the anchor — exclude that day from the agg side
-            week_key = (sun, anchor_day_str, False)
+            week_key = (sun, anchor_day_str, args.no_weekly)
     else:
-        week_key = (sun, None, False)
+        week_key = (sun, None, args.no_weekly)
     # week_offset <= 0 -> week is older-or-same -> week on left, anchor on right.
     # week_offset >  0 -> anchor on left, week on right.
     if week_offset <= 0:
