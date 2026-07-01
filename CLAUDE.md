@@ -21,13 +21,14 @@ python3 tdiff --dupes today --no-color
 python3 tdiff today -w -1 --no-color
 python3 tdiff 2026-05-17 w20 --no-color    # day vs weekly planning file
 python3 tdiff w20 -w -1 --no-color         # weekly file as anchor for week offset
+python3 tdiff w23 w24 -F --no-color        # full Sun-Sat week vs full Sun-Sat week
 ```
 
 No test suite — testing is manual via CLI invocation.
 
 ## Architecture
 
-The entire tool lives in a single executable file: `tdiff` (444 lines, Python 3).
+The entire tool lives in a single executable file: `tdiff` (554 lines, Python 3).
 
 The script processes tasks in this pipeline:
 
@@ -35,7 +36,7 @@ The script processes tasks in this pipeline:
 
 2. **Deduplicate** — `cluster_records()` uses union-find to merge task variants across days. `is_same_task()` merges if token sets are identical OR one is a strict subset sharing the same first word. `materialize()` picks the canonical form (most recent day, longest on tie) and winning status (priority: `x > -/# > !/*/space > / > &«»>=~`).
 
-3. **Week aggregation** (`fetch_week()`) — Groups 7 daily notes into one virtual note using US Sun-Sat weeks, and merges in the `02 Weekly/YYYY-W##` file for that week at `day_index=7` (highest dedup priority, so weekly file wording wins ties). Missing weekly files are silently skipped. In `-w 0` mode the anchor is excluded from its own week aggregation: if the anchor is a day, that day is excluded from daily notes; if it's a weekly file, the weekly file is excluded from the agg side.
+3. **Week aggregation** (`fetch_week()`, built on `week_records()`) — Groups 7 daily notes into one virtual note using US Sun-Sat weeks, and merges in the `02 Weekly/YYYY-W##` file for that week at `day_index=0` (lowest dedup priority among the 7 days — losing ties against any daily note). Missing weekly files are silently skipped. In `-w 0` mode the anchor is excluded from its own week aggregation: if the anchor is a day, that day is excluded from daily notes; if it's a weekly file, the weekly file is excluded from the agg side. `-F/--full-week` (`to_full_week_side()`) expands *both* sides of a plain two-date or `--dupes` comparison into their containing full week independently — no anchor-exclusion, since neither side is "inside" the other.
 
 4. **Diff** — Pass 1 does exact name matching; Pass 2 uses `best_match()` with Jaccard and prefix similarity at 0.7 threshold to relabel close add/delete pairs as "changed".
 
@@ -47,7 +48,8 @@ The script processes tasks in this pipeline:
 |------|--------|
 | `-t N` | Compare anchor vs anchor ± N days |
 | `-w N` | Compare anchor vs Sun-Sat week N weeks away |
-| `-W` | With `-w`, exclude the `02 Weekly/YYYY-W##` planning file from the aggregation |
+| `-F` | Expand day/weekly-file arguments to their full Sun-Sat week aggregation (works with day-vs-day, weekly-file-vs-weekly-file, or mixed; also with `-D`) |
+| `-W` | With `-w` or `-F`, exclude the `02 Weekly/YYYY-W##` planning file from the aggregation |
 | `-D` | Find duplicates within a single date |
 | `-d/-a/-c/-s` | Show deleted/added/changed/same tasks |
 | `-I` | Hide terminal-status items (`x`, `-`, `&`, `»`, `«`) |
@@ -56,4 +58,4 @@ The script processes tasks in this pipeline:
 
 ## Date formats
 
-`YYYY-MM-DD`, `today`, `yesterday`, `0` (today), `-N` (N days ago), `w##` or `w2026-W##` (weekly planning file, e.g. `w20` = week 20 of current year). Negative numbers use an internal `__NEG__` token workaround to avoid argparse conflicts. Weekly file refs resolve to side type `('weekly_file', 'YYYY-W##')` and are supported in day-vs-day, `-w`, and `-D` modes (not `-t`).
+`YYYY-MM-DD`, `today`, `yesterday`, `0` (today), `-N` (N days ago), `w##` or `w2026-W##` (weekly planning file, e.g. `w20` = week 20 of current year). Negative numbers use an internal `__NEG__` token workaround to avoid argparse conflicts. Weekly file refs resolve to side type `('weekly_file', 'YYYY-W##')` and are supported in day-vs-day, `-w`, and `-D` modes (not `-t`). With `-F`, either side (day or weekly file) is further expanded to side type `('week', ...)` — its containing full Sun-Sat week.

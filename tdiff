@@ -159,8 +159,8 @@ def week_span(d):
     week_num = ((sun - jan1).days + days_back) // 7 + 1
     return sun, sat, f"{sun.year}-W{week_num:02d}"
 
-def fetch_week(sunday, exclude=None, exclude_weekly_file=False):
-    """Group 7 daily notes Sun..Sat plus weekly planning file into one virtual note.
+def week_records(sunday, exclude=None, exclude_weekly_file=False):
+    """Gather raw (base, status, day_index) records for a Sun-Sat week, without materializing.
     `exclude` (ISO date string): skip that day. `exclude_weekly_file`: omit the weekly file."""
     _, _, week_label = week_span(sunday)
     records = []
@@ -171,7 +171,11 @@ def fetch_week(sunday, exclude=None, exclude_weekly_file=False):
         records.extend(_parse_lines(d, i))
     if not exclude_weekly_file:
         records.extend(_parse_weekly_file(week_label, day_index=0))
-    return materialize(cluster_records(records))
+    return records
+
+def fetch_week(sunday, exclude=None, exclude_weekly_file=False):
+    """Group 7 daily notes Sun..Sat plus weekly planning file into one virtual note."""
+    return materialize(cluster_records(week_records(sunday, exclude, exclude_weekly_file)))
 
 def fetch_weekly_file(week_label):
     """Fetch and deduplicate tasks from a single weekly planning file."""
@@ -230,7 +234,9 @@ parser.add_argument('-t', '--offset',     type=str, default=None,
 parser.add_argument('-w', '--week-offset', type=str, default=None,
                     help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
 parser.add_argument('-W', '--no-weekly',  action='store_true',
-                    help='exclude the 02 Weekly/YYYY-W## planning file from -w aggregation')
+                    help='exclude the 02 Weekly/YYYY-W## planning file from -w/-F aggregation')
+parser.add_argument('-F', '--full-week',  action='store_true',
+                    help='expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
 
@@ -288,6 +294,18 @@ def _week_label_to_sunday(week_label):
     days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
     return jan1 - timedelta(days=days_back) + timedelta(weeks=week_num - 1)
 
+def to_full_week_side(side, exclude_weekly_file=False):
+    """Expand a day/weekly_file side into its containing Sun-Sat full-week aggregate.
+    Unlike -w 0 mode, no anchor-exclusion is applied — both sides are independent weeks."""
+    kind, key = side
+    if kind == 'weekly_file':
+        sun = _week_label_to_sunday(key)
+    elif kind == 'day':
+        sun, _, _ = week_span(key)
+    else:
+        return side
+    return ('week', (sun, None, exclude_weekly_file))
+
 offset = None
 if args.offset is not None:
     try:
@@ -302,8 +320,12 @@ if args.week_offset is not None:
     except ValueError:
         parser.error(f"--week-offset expects an integer, got {args.week_offset!r}")
 
-if args.no_weekly and args.week_offset is None:
-    parser.error("--no-weekly only applies to -w/--week-offset aggregation")
+if args.full_week and offset is not None:
+    parser.error("--full-week cannot be combined with --offset")
+if args.full_week and week_offset is not None:
+    parser.error("--full-week cannot be combined with --week-offset")
+if args.no_weekly and args.week_offset is None and not args.full_week:
+    parser.error("--no-weekly only applies to -w/--week-offset or -F/--full-week aggregation")
 
 raw_a = restore(args.date_a)
 raw_b = restore(args.date_b) if args.date_b is not None else None
@@ -374,12 +396,19 @@ elif args.date_b is not None:
     side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
     side_b = ('weekly_file', week_label_b) if week_label_b else ('day', resolve_date(raw_b))
     date_b = raw_b
+    if args.full_week:
+        side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
+        side_b = to_full_week_side(side_b, exclude_weekly_file=args.no_weekly)
+        if side_a[1][0] == side_b[1][0]:
+            parser.error("both dates fall in the same Sun-Sat week; --full-week comparison would be a no-op")
 elif not args.dupes:
     parser.error("date_b is required (or use --dupes, --offset N, or --week-offset N)")
 else:
     # dupes mode — anchor may be a day or a weekly file
     date_b = None
     side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
+    if args.full_week:
+        side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
 
 ignore_set = PROJECT_STATUSES | (DEFAULT_IGNORE if args.ignore else set())
 
@@ -399,6 +428,10 @@ if args.dupes:
     if _kind == 'weekly_file':
         _raw_records = list(_parse_weekly_file(_key, day_index=0))
         _label = _key
+    elif _kind == 'week':
+        _sun, _exclude_day, _exclude_wf = _key
+        _raw_records = week_records(_sun, exclude=_exclude_day, exclude_weekly_file=_exclude_wf)
+        _, _, _label = week_span(_sun)
     else:
         _raw_records = list(_parse_lines(_key, 0))
         _label = _key

@@ -45,6 +45,10 @@ tdiff w19 w20                  # weekly planning file week 19 vs week 20
 tdiff w20 -D                   # find duplicates within a weekly planning file
 tdiff w20 -w -1                # weekly planning file W20 vs aggregated week W19
 tdiff w20 -w 0                 # weekly planning file W20 vs W20 daily notes only
+
+tdiff w23 w24 -F                # full Sun-Sat week 23 vs full Sun-Sat week 24
+tdiff 2026-06-08 2026-06-15 -F  # same idea, using any day within each week
+tdiff w23 -D -F                 # find duplicates across all of week 23 (daily notes + weekly file)
 ```
 
 ## Flags
@@ -59,6 +63,8 @@ tdiff w20 -w 0                 # weekly planning file W20 vs W20 daily notes onl
 | `-D` / `--dupes`   | Duplicate finder for a single date |
 | `-t N` / `--offset N` | Compare anchor with anchor + N days (N nonzero, may be negative) |
 | `-w N` / `--week-offset N` | Compare anchor day with the Sun-Sat week N weeks away (N is any integer: negative, 0, or positive) |
+| `-F` / `--full-week` | Expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing (also works with `-D`) |
+| `-W` / `--no-weekly` | With `-w` or `-F`, exclude the weekly planning file from the week aggregation |
 | `--no-color` | Disable colored output |
 | `--no-summary` | Suppress the summary line |
 
@@ -67,8 +73,9 @@ If no `-d/-a/-c/-s` is given, all types except `same` are shown.
 ## Notes
 
 - Daily notes are read from `01 Daily/<YYYY-MM-DD>` via the `obsidian` CLI; `#routine` tasks are filtered out.
-- Weekly planning files live at `02 Weekly/YYYY-W##`. In `-w` mode, the weekly planning file for the target week is automatically merged into the week aggregation (those tasks get highest dedup priority). Missing weekly files are silently ignored.
+- Weekly planning files live at `02 Weekly/YYYY-W##`. In `-w` or `-F` mode, the weekly planning file for the target week is automatically merged into the week aggregation (losing dedup ties against any daily note in that week). Missing weekly files are silently ignored. Use `-W` to exclude it from the aggregation.
 - `w##` / `w2026-W##` can also be used as a direct date argument for day-vs-file or file-vs-file comparisons, as an anchor for `-w`, or as the target of `-D`.
+- `-F` expands either side of a plain two-date or `-D` comparison (day or weekly file) into its containing full Sun-Sat week — unlike `-w`, both sides are independent weeks, so there's no self-exclusion logic.
 - Project items (statuses `p`, `i`, `u`) are always excluded from output.
 - Section suffixes (`task name - section`) are stripped before comparison so the same task under different daily sections still matches.
 - Week aggregation uses **US Sun-Sat**, not ISO Mon-Sun. Internal label format: `%Y-W%U`.
