@@ -52,7 +52,7 @@ The script processes tasks in this pipeline:
 | `-W` | With `-w` or `-F`, exclude the `02 Weekly/YYYY-W##` planning file from the aggregation |
 | `-D` | Find duplicates within a single date |
 | `-d/-a/-c/-s` | Show deleted/added/changed/same tasks |
-| `-I` | Hide terminal-status items (`x`, `-`, `&`, `»`, `«`) |
+| `-I` | Hide terminal-status items (`x`, `-`, `&`, `»`, `«`) on the A side only — suppresses deleted/unchanged rows whose A-status is terminal; added and changed rows are always shown |
 | `--no-color` | Disable ANSI colors |
 | `--no-summary` | Suppress summary line |
 

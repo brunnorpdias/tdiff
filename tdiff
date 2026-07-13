@@ -228,7 +228,8 @@ parser.add_argument('-c', '--changed',    action='store_true', help='show change
 parser.add_argument('-s', '--same',       action='store_true', help='show unchanged tasks')
 parser.add_argument('-D', '--dupes',      action='store_true', help='find duplicate tasks in a single date')
 parser.add_argument('-I', '--ignore',     action='store_true',
-                    help='hide tasks in terminal statuses (done, cancelled, overrun, postponed, advanced)')
+                    help='hide terminal-status tasks (done, cancelled, overrun, postponed, advanced) '
+                         'on the A side (deleted/unchanged rows); added and changed rows are always shown')
 parser.add_argument('-t', '--offset',     type=str, default=None,
                     help='compare anchor (date_a) with date_a + N days; N may be negative')
 parser.add_argument('-w', '--week-offset', type=str, default=None,
@@ -533,8 +534,10 @@ type_enabled = {0: args.deleted, 1: args.added, 2: args.changed, 3: args.same}
 
 counts = {0: 0, 1: 0, 2: 0, 3: 0}
 for _, typ, line, eff in output:
-    if eff in ignore_set:
+    if eff in PROJECT_STATUSES:          # structural: always excluded, any row
         continue
+    if args.ignore and typ in (0, 3) and eff in DEFAULT_IGNORE:
+        continue                          # -I: hide only settled A-side (deleted/same) rows
     counts[typ] += 1
     if show_all:
         if typ != 3:   # hide same by default (legacy behavior)
