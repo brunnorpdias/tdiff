@@ -217,7 +217,7 @@ parser = argparse.ArgumentParser(
     epilog=(
         'Dates accept YYYY-MM-DD, "today", "yesterday", "0" (today), -N (e.g. -1 for yesterday), '
         'or w## / w2026-W## for a weekly planning file (e.g. w20 = week 20 of the current year). '
-        'Use -t N to compare the anchor with anchor + N days; N may be negative.'
+        'Use -o N to compare the anchor with anchor + N days; N may be negative.'
     ),
 )
 parser.add_argument('date_a', help='first (older) date')
@@ -230,8 +230,12 @@ parser.add_argument('-D', '--dupes',      action='store_true', help='find duplic
 parser.add_argument('-I', '--ignore',     action='store_true',
                     help='hide terminal-status tasks (done, cancelled, overrun, postponed, advanced) '
                          'on the A side (deleted/unchanged rows); added and changed rows are always shown')
-parser.add_argument('-t', '--offset',     type=str, default=None,
+parser.add_argument('-o', '--offset',     type=str, default=None,
                     help='compare anchor (date_a) with date_a + N days; N may be negative')
+parser.add_argument('-S', '--status',     type=str, default=None,
+                    help="show only rows whose effective status is in the given set "
+                         "(concatenated chars, e.g. 'x-#'); prefix '^' to invert (e.g. '^x'). "
+                         "Bare '-S -' looks like a flag to argparse; use -S=- or quote in a set ('x-')")
 parser.add_argument('-w', '--week-offset', type=str, default=None,
                     help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
 parser.add_argument('-W', '--no-weekly',  action='store_true',
@@ -413,6 +417,23 @@ else:
 
 ignore_set = PROJECT_STATUSES | (DEFAULT_IGNORE if args.ignore else set())
 
+status_filter = None            # (set_of_chars, negate)
+if args.status is not None:
+    v = args.status
+    negate = v.startswith('^')
+    if negate:
+        v = v[1:]
+    chars = set(v)
+    if not chars:
+        parser.error("--status expects at least one status char (e.g. 'x-#' or '^x')")
+    status_filter = (chars, negate)
+
+def status_match(eff):
+    if status_filter is None:
+        return True
+    chars, negate = status_filter
+    return (eff not in chars) if negate else (eff in chars)
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 
 use_color = not args.no_color and sys.stdout.isatty()
@@ -444,6 +465,8 @@ if args.dupes:
             continue
         winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
         if winning[1] in ignore_set:
+            continue
+        if not status_match(winning[1]):
             continue
         # Group records by base within the cluster
         by_base = {}
@@ -539,6 +562,8 @@ for _, typ, line, eff in output:
     if args.ignore and typ in (0, 3) and eff in DEFAULT_IGNORE:
         continue                          # -I: hide only settled A-side (deleted/same) rows
     counts[typ] += 1
+    if not status_match(eff):          # -S: show only matching effective statuses (print-only)
+        continue
     if show_all:
         if typ != 3:   # hide same by default (legacy behavior)
             print(line)
