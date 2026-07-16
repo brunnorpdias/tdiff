@@ -222,10 +222,11 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('date_a', help='first (older) date')
 parser.add_argument('date_b', nargs='?', default=None, help='second (newer) date (omit with --dupes)')
-parser.add_argument('-d', '--deleted',    action='store_true', help='show deleted tasks')
-parser.add_argument('-a', '--added',      action='store_true', help='show added tasks')
-parser.add_argument('-c', '--changed',    action='store_true', help='show changed tasks')
-parser.add_argument('-s', '--same',       action='store_true', help='show unchanged tasks')
+parser.add_argument('-T', '--types',      type=str, default=None,
+                    help="show only rows of the given types (chars from 'dacs': "
+                         "d=deleted, a=added, c=changed, s=same, e.g. 'dac'); "
+                         "prefix '^' to invert (e.g. '^s'). Default: show all types, "
+                         "with same-status rows grouped at the bottom.")
 parser.add_argument('-D', '--dupes',      action='store_true', help='find duplicate tasks in a single date')
 parser.add_argument('-I', '--ignore',     action='store_true',
                     help='hide terminal-status tasks (done, cancelled, overrun, postponed, advanced) '
@@ -434,6 +435,24 @@ def status_match(eff):
     chars, negate = status_filter
     return (eff not in chars) if negate else (eff in chars)
 
+TYPE_CHARS = {'d': 0, 'a': 1, 'c': 2, 's': 3}
+
+type_filter = None      # (set_of_type_ints, negate)
+if args.types is not None:
+    v = args.types
+    negate = v.startswith('^')
+    if negate:
+        v = v[1:]
+    if not v or any(ch not in TYPE_CHARS for ch in v):
+        parser.error("--types expects chars from 'dacs' (e.g. 'dac' or '^s')")
+    type_filter = ({TYPE_CHARS[ch] for ch in v}, negate)
+
+def type_match(typ):
+    if type_filter is None:
+        return True
+    types, negate = type_filter
+    return (typ not in types) if negate else (typ in types)
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 
 use_color = not args.no_color and sys.stdout.isatty()
@@ -548,12 +567,9 @@ for b_name in remaining_b:
         eff = b_tasks[b_name][1]
         output.append((b_name, 1, f"{GREEN}++ {b_tasks[b_name]}  {b_name}{RESET}", eff))
 
-output.sort(key=lambda x: (x[0].lower(), x[1]))
+output.sort(key=lambda x: (x[1] == 3, x[0].lower()))
 
 # ── Filter & print ────────────────────────────────────────────────────────────
-
-show_all = not any([args.deleted, args.added, args.changed, args.same])
-type_enabled = {0: args.deleted, 1: args.added, 2: args.changed, 3: args.same}
 
 counts = {0: 0, 1: 0, 2: 0, 3: 0}
 for _, typ, line, eff in output:
@@ -561,22 +577,22 @@ for _, typ, line, eff in output:
         continue
     if args.ignore and typ in (0, 3) and eff in DEFAULT_IGNORE:
         continue                          # -I: hide only settled A-side (deleted/same) rows
-    counts[typ] += 1
-    if not status_match(eff):          # -S: show only matching effective statuses (print-only)
+    if not status_match(eff):          # -S: show only matching effective statuses
         continue
-    if show_all:
-        if typ != 3:   # hide same by default (legacy behavior)
-            print(line)
-    elif type_enabled[typ]:
-        print(line)
+    if not type_match(typ):            # -T: show only matching row types
+        continue
+    counts[typ] += 1
+    print(line)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 if not args.no_summary:
+    total = sum(counts.values())
     parts = [
         f"{GREEN}{counts[1]} added{RESET}",
         f"{RED}{counts[0]} deleted{RESET}",
         f"{YELLOW}{counts[2]} changed{RESET}",
         f"{DIM}{counts[3]} same{RESET}",
+        f"{total} total",
     ]
     print('  ' + f"  {DIM}·{RESET}  ".join(parts))

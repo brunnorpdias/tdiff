@@ -16,7 +16,7 @@ tdiff date_a [date_b] [flags]
 
 # Common invocations during development
 python3 tdiff 2026-04-14 2026-04-15 --no-color
-python3 tdiff yesterday today --no-color --same
+python3 tdiff yesterday today --no-color -T s
 python3 tdiff --dupes today --no-color
 python3 tdiff today -w -1 --no-color
 python3 tdiff 2026-05-17 w20 --no-color    # day vs weekly planning file
@@ -51,9 +51,9 @@ The script processes tasks in this pipeline:
 | `-F` | Expand day/weekly-file arguments to their full Sun-Sat week aggregation (works with day-vs-day, weekly-file-vs-weekly-file, or mixed; also with `-D`) |
 | `-W` | With `-w` or `-F`, exclude the `02 Weekly/YYYY-W##` planning file from the aggregation |
 | `-D` | Find duplicates within a single date |
-| `-d/-a/-c/-s` | Show deleted/added/changed/same tasks |
+| `-T SET` | Show only rows whose type is in a char set (`d`=deleted, `a`=added, `c`=changed, `s`=same, e.g. `dac`); prefix `^` to invert (e.g. `^s`). Summary counts reflect the filtered rows. Default (no `-T`): show all types, with `same` rows sorted after every other row. |
 | `-I` | Hide terminal-status items (`x`, `-`, `&`, `»`, `«`) on the A side only — suppresses deleted/unchanged rows whose A-status is terminal; added and changed rows are always shown. (A hard-coded negative special case of `-S`.) |
-| `-S SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`). Filters on the displayed status (B's for added/changed/same, A's for deleted); print-only, so summary counts are unaffected. Bare `-S -` needs `-S=-` |
+| `-S SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`). Filters on the displayed status (B's for added/changed/same, A's for deleted); summary counts reflect the filtered rows. Bare `-S -` needs `-S=-` |
 | `--no-color` | Disable ANSI colors |
 | `--no-summary` | Suppress summary line |
 

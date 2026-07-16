@@ -38,7 +38,7 @@ tdiff yesterday -w 0           # anchor day vs the rest of its own Sun-Sat week
 tdiff -14 -w 1                 # anchor day vs the Sun-Sat week one week later
 
 tdiff today -D                 # find duplicates within a single date
-tdiff today -a -I              # only additions, hiding terminal-status items
+tdiff today -T a -I            # only additions, hiding terminal-status items
 
 tdiff yesterday today -S x     # only rows that are now done
 tdiff yesterday today -S '^x'  # everything except done
@@ -59,10 +59,7 @@ tdiff w23 -D -F                 # find duplicates across all of week 23 (daily n
 
 | Flag | Meaning |
 | --- | --- |
-| `-d` / `--deleted` | Show deleted tasks |
-| `-a` / `--added`   | Show added tasks |
-| `-c` / `--changed` | Show changed tasks |
-| `-s` / `--same`    | Show unchanged tasks (hidden by default) |
+| `-T SET` / `--types SET` | Show only rows whose type is in a char set (`d`=deleted, `a`=added, `c`=changed, `s`=same, e.g. `dac`); prefix `^` to invert (e.g. `^s`) |
 | `-I` / `--ignore`  | Hide tasks in terminal statuses (`x`, `-`, `&`, `»`, `«`) on the A side |
 | `-S SET` / `--status SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`) |
 | `-D` / `--dupes`   | Duplicate finder for a single date |
@@ -73,7 +70,7 @@ tdiff w23 -D -F                 # find duplicates across all of week 23 (daily n
 | `--no-color` | Disable colored output |
 | `--no-summary` | Suppress the summary line |
 
-If no `-d/-a/-c/-s` is given, all types except `same` are shown.
+By default all types are shown, with `same` rows sorted after every other row. Use `-T` to filter to specific types.
 
 ## Notes
 
@@ -81,7 +78,7 @@ If no `-d/-a/-c/-s` is given, all types except `same` are shown.
 - Weekly planning files live at `02 Weekly/YYYY-W##`. In `-w` or `-F` mode, the weekly planning file for the target week is automatically merged into the week aggregation (losing dedup ties against any daily note in that week). Missing weekly files are silently ignored. Use `-W` to exclude it from the aggregation.
 - `w##` / `w2026-W##` can also be used as a direct date argument for day-vs-file or file-vs-file comparisons, as an anchor for `-w`, or as the target of `-D`.
 - `-F` expands either side of a plain two-date or `-D` comparison (day or weekly file) into its containing full Sun-Sat week — unlike `-w`, both sides are independent weeks, so there's no self-exclusion logic.
-- `-S` filters on each row's **effective status** — the status actually shown in the row (`B`'s status for added/changed/same rows, `A`'s status for deleted rows). It is print-only, so the summary line still reports true totals. A leading `^` inverts the whole set (`-S ^x` = everything except done). It composes with the `-d/-a/-c/-s` type filters and with `-I`. Note: a bare `-S -` (only cancelled) looks like a flag to the parser — write it as `-S=-` or fold it into a set (`-S 'x-'`).
+- `-S` filters on each row's **effective status** — the status actually shown in the row (`B`'s status for added/changed/same rows, `A`'s status for deleted rows). The summary line's counts (and total) reflect whatever `-S`, `-T`, and `-I` leave visible. A leading `^` inverts the whole set (`-S ^x` = everything except done). It composes with the `-T` type filter and with `-I`. Note: a bare `-S -` (only cancelled) looks like a flag to the parser — write it as `-S=-` or fold it into a set (`-S 'x-'`).
 - `-I` is effectively the hard-coded negative special case of `-S`: it hides terminal-status rows (`x`, `-`, `&`, `»`, `«`) on the A side only (deleted and unchanged rows); added and changed rows are always shown.
 - Project items (statuses `p`, `i`, `u`) are always excluded from output.
 - Section suffixes (`task name - section`) are stripped before comparison so the same task under different daily sections still matches.
