@@ -2,17 +2,39 @@
 
 Diff tasks between Obsidian daily notes.
 
-A single-file Python CLI that pulls tasks from your Obsidian daily notes (`01 Daily/<YYYY-MM-DD>`) and weekly planning files (`02 Weekly/YYYY-W##`) and reports what was added, removed, changed, or kept between two dates — or between a day/weekly-file and an aggregated week.
+A single-file Python CLI that pulls tasks from your Obsidian daily notes (`<YYYY-MM-DD>`) and weekly planning files (`YYYY-W##`) and reports what was added, removed, changed, or kept between two dates — or between a day/weekly-file and an aggregated week.
+
+File lookups are folder-agnostic: notes are resolved by filename anywhere in the vault (like an Obsidian wikilink), so `tdiff` doesn't care which folder your daily notes or weekly files actually live in. See [Configuration](#configuration) if you ever need to pin explicit folders.
 
 ## Requirements
 
-- Python 3
+- Python 3.11+ (uses the stdlib `tomllib` for config parsing)
 - The `obsidian` CLI (used to dump tasks per file)
 - `rg` (ripgrep, used to filter `#routine` tasks)
 
 ## Install
 
 Drop `tdiff` somewhere on your `$PATH`. It's executable (`#!/usr/bin/env python3`).
+
+## Configuration
+
+Task-status behavior (dedup priority, `-I`'s ignore set, structural "project" exclusion) and vault folder overrides live in a TOML config file — not hardcoded in the script.
+
+**Location** (first match wins): `--config PATH` flag → `$TDIFF_CONFIG` env var → `$XDG_CONFIG_HOME/tdiff/config.toml` → `~/.config/tdiff/config.toml`.
+
+If the resolved path doesn't exist, `tdiff` creates it (with parent dirs) pre-populated with the built-in defaults the first time you run it, and prints a one-time note to stderr. A reference copy of those defaults also lives in this repo at [`config.example.toml`](config.example.toml) — copy it to the path above (or just run `tdiff` once) to get started, then edit to taste. Once the file exists it is the **complete** status table — a status char not listed in it falls back to `priority=0, ignore=false, project=false`.
+
+```toml
+[statuses.x]
+name = "done"
+priority = 5     # dedup precedence: higher wins when a task appears multiple times (ties break by most recent day)
+ignore = true    # hidden by -I on the settled (A) side of a diff
+# project = true # (not set here) structural marker; always excluded from every output
+
+[vault]
+daily_folder = ""    # optional explicit folder prefix; empty = resolve by filename anywhere in the vault
+weekly_folder = ""
+```
 
 ## Usage
 
@@ -74,8 +96,8 @@ By default all types are shown, with `same` rows sorted after every other row. U
 
 ## Notes
 
-- Daily notes are read from `01 Daily/<YYYY-MM-DD>` via the `obsidian` CLI; `#routine` tasks are filtered out.
-- Weekly planning files live at `02 Weekly/YYYY-W##`. In `-w` or `-F` mode, the weekly planning file for the target week is automatically merged into the week aggregation (losing dedup ties against any daily note in that week). Missing weekly files are silently ignored. Use `-W` to exclude it from the aggregation.
+- Daily notes (`<YYYY-MM-DD>`) are resolved by filename anywhere in the vault via the `obsidian` CLI; `#routine` tasks are filtered out. Pin an explicit folder with `[vault] daily_folder` in the config file if name resolution ever becomes ambiguous.
+- Weekly planning files (`YYYY-W##`) resolve the same way (or via `[vault] weekly_folder`). In `-w` or `-F` mode, the weekly planning file for the target week is automatically merged into the week aggregation (losing dedup ties against any daily note in that week). Missing weekly files are silently ignored. Use `-W` to exclude it from the aggregation.
 - `w##` / `w2026-W##` can also be used as a direct date argument for day-vs-file or file-vs-file comparisons, as an anchor for `-w`, or as the target of `-D`.
 - `-F` expands either side of a plain two-date or `-D` comparison (day or weekly file) into its containing full Sun-Sat week — unlike `-w`, both sides are independent weeks, so there's no self-exclusion logic.
 - `-S` filters on each row's **effective status** — the status actually shown in the row (`B`'s status for added/changed/same rows, `A`'s status for deleted rows). The summary line's counts (and total) reflect whatever `-S`, `-T`, and `-I` leave visible. A leading `^` inverts the whole set (`-S ^x` = everything except done). It composes with the `-T` type filter and with `-I`. Note: a bare `-S -` (only cancelled) looks like a flag to the parser — write it as `-S=-` or fold it into a set (`-S 'x-'`).
@@ -87,7 +109,7 @@ By default all types are shown, with `same` rows sorted after every other row. U
 
 ### Task statuses
 
-Each task carries a single-character status (the `[ ]` marker in Obsidian). These are the characters `-S` and `-I` operate on:
+Each task carries a single-character status (the `[ ]` marker in Obsidian). These are the characters `-S` and `-I` operate on. The table below reflects the built-in defaults — all of it (names, priority, ignore/project flags, and which chars exist at all) is configurable via `~/.config/tdiff/config.toml`; see [Configuration](#configuration).
 
 | Status | Meaning | Notes |
 | --- | --- | --- |
@@ -98,11 +120,16 @@ Each task carries a single-character status (the `[ ]` marker in Obsidian). Thes
 | `«` | Advanced | Terminal (intra-day marker) |
 | `!` | Urgent | |
 | `*` | Important | |
-| ` ` (space) | No status / open | Quote it for `-S`: `-S ' '` |
-| `#` | Blocked | |
-| `/` | Partial / in progress | |
-| `>` `=` `~` | Other intra-day markers | |
-| `p` `i` `u` | Project items | Always excluded from output |
+| ` ` (space) | Task (no status / open) | Quote it for `-S`: `-S ' '` |
+| `#` | Blocked / waiting | |
+| `o` | Recurrent | |
+| `/` | Partial | |
+| `>` | Current | Intra-day marker |
+| `=` | Paused / switch | Intra-day marker |
+| `~` | Snoozed | Intra-day marker |
+| `p` | Project | Always excluded from output |
+| `i` | Important project | Always excluded from output |
+| `u` | Urgent project | Always excluded from output |
 
 Dedup priority (highest wins when the same task appears with different statuses): `x` > `-` > `!`/`*`/`#`/` ` > `/` > intra-day markers; ties resolve to the latest day.
 

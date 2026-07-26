@@ -1,0 +1,96 @@
+# Reference copy of tdiff's built-in default config — mirrors DEFAULT_CONFIG_TOML
+# in `tdiff`. Not read by tdiff directly: it auto-generates the real config at
+# --config / $TDIFF_CONFIG / $XDG_CONFIG_HOME/tdiff/config.toml / ~/.config/tdiff/config.toml
+# on first run. Copy this file there (or just run tdiff once) to get started,
+# then edit to taste.
+
+# tdiff status configuration
+# Each [statuses.X] table describes one task-status character (the char inside
+# "[ ]" in a task line).
+#   priority = <int>  dedup precedence when a task appears multiple times
+#                     (higher wins; ties break by most recent day).
+#                     Chars omitted here default to priority 0.
+#   ignore   = true   hidden by -I/--ignore on the settled (A) side of a diff
+#   project  = true   structural marker; always excluded from every output
+#
+# This file is loaded as the complete status table — a status char not listed
+# here falls back to priority 0 / ignore false / project false.
+
+[statuses.x]
+name = "done"
+priority = 5
+ignore = true
+
+[statuses."-"]
+name = "cancelled"
+priority = 4
+ignore = true
+
+[statuses."!"]
+name = "urgent"
+priority = 3
+
+[statuses."*"]
+name = "important"
+priority = 3
+
+[statuses." "]
+name = "task"
+priority = 3
+
+[statuses."#"]
+name = "blocked / waiting"
+priority = 3
+
+[statuses.o]
+name = "recurrent"
+priority = 3
+
+[statuses."/"]
+name = "partial"
+priority = 2
+
+[statuses."&"]
+name = "overrun"
+priority = 1
+ignore = true
+
+[statuses."»"]
+name = "postponed"
+priority = 1
+ignore = true
+
+[statuses."«"]
+name = "advanced"
+priority = 1
+ignore = true
+
+[statuses.">"]
+name = "current"
+priority = 1
+
+[statuses."="]
+name = "paused / switch"
+priority = 1
+
+[statuses."~"]
+name = "snoozed"
+priority = 1
+
+[statuses.p]
+name = "project"
+project = true
+
+[statuses.i]
+name = "important project"
+project = true
+
+[statuses.u]
+name = "urgent project"
+project = true
+
+[vault]
+# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
+# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
+daily_folder = ""
+weekly_folder = ""

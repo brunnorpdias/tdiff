@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import sys, re, subprocess, difflib, argparse
+import sys, re, os, subprocess, difflib, argparse, tomllib
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 JACCARD_THRESHOLD = 0.7
 PREFIX_THRESHOLD  = 0.7
@@ -19,20 +20,142 @@ def strip_section_suffix(s):
             return s[:i].strip()
     return s.strip()
 
-# Statuses hidden when -I is active
-DEFAULT_IGNORE   = {'x', '-', '&', '»', '«'}
-# Project items are structural — always excluded from all output
-PROJECT_STATUSES = {'p', 'i', 'u'}
+# Populated by load_config() once args are parsed. Placeholder empty values here
+# so nothing explodes if referenced before load_config() runs.
+STATUS_PRIORITY  = {}
+DEFAULT_IGNORE   = set()
+PROJECT_STATUSES = set()
+DAILY_FOLDER  = ''
+WEEKLY_FOLDER = ''
 
-# Dedup priority: when a task appears multiple times in a file, the status with
-# the highest priority wins. Ties break by document order (latest wins).
-STATUS_PRIORITY = {
-    'x': 5,                                                 # done (sticky)
-    '-': 4,                                                 # cancelled
-    '!': 3, '*': 3, ' ': 3, '#': 3,                         # urgent, important, no-status, blocked
-    '/': 2,                                                 # partial
-    '&': 1, '«': 1, '»': 1, '>': 1, '=': 1, '~': 1,         # intra-day markers
-}
+DEFAULT_CONFIG_TOML = '''\
+# tdiff status configuration
+# Each [statuses.X] table describes one task-status character (the char inside
+# "[ ]" in a task line).
+#   priority = <int>  dedup precedence when a task appears multiple times
+#                     (higher wins; ties break by most recent day).
+#                     Chars omitted here default to priority 0.
+#   ignore   = true   hidden by -I/--ignore on the settled (A) side of a diff
+#   project  = true   structural marker; always excluded from every output
+#
+# This file is loaded as the complete status table — a status char not listed
+# here falls back to priority 0 / ignore false / project false.
+
+[statuses.x]
+name = "done"
+priority = 5
+ignore = true
+
+[statuses."-"]
+name = "cancelled"
+priority = 4
+ignore = true
+
+[statuses."!"]
+name = "urgent"
+priority = 3
+
+[statuses."*"]
+name = "important"
+priority = 3
+
+[statuses." "]
+name = "task"
+priority = 3
+
+[statuses."#"]
+name = "blocked / waiting"
+priority = 3
+
+[statuses.o]
+name = "recurrent"
+priority = 3
+
+[statuses."/"]
+name = "partial"
+priority = 2
+
+[statuses."&"]
+name = "overrun"
+priority = 1
+ignore = true
+
+[statuses."»"]
+name = "postponed"
+priority = 1
+ignore = true
+
+[statuses."«"]
+name = "advanced"
+priority = 1
+ignore = true
+
+[statuses.">"]
+name = "current"
+priority = 1
+
+[statuses."="]
+name = "paused / switch"
+priority = 1
+
+[statuses."~"]
+name = "snoozed"
+priority = 1
+
+[statuses.p]
+name = "project"
+project = true
+
+[statuses.i]
+name = "important project"
+project = true
+
+[statuses.u]
+name = "urgent project"
+project = true
+
+[vault]
+# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
+# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
+daily_folder = ""
+weekly_folder = ""
+'''
+
+def config_path(override):
+    if override:
+        return Path(override)
+    env = os.environ.get('TDIFF_CONFIG')
+    if env:
+        return Path(env)
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    base = Path(xdg) if xdg else Path.home() / '.config'
+    return base / 'tdiff' / 'config.toml'
+
+def load_config(override, error):
+    """Load status/vault config from TOML, bootstrapping a default file on first run.
+    Populates the module-level STATUS_PRIORITY, DEFAULT_IGNORE, PROJECT_STATUSES,
+    DAILY_FOLDER, WEEKLY_FOLDER globals. `error` is a callable(msg) for fatal errors."""
+    global STATUS_PRIORITY, DEFAULT_IGNORE, PROJECT_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER
+    path = config_path(override)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(DEFAULT_CONFIG_TOML)
+        print(f"tdiff: created default config at {path}", file=sys.stderr)
+    try:
+        with path.open('rb') as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        error(f"invalid config at {path}: {e}")
+        return
+
+    statuses = data.get('statuses', {})
+    STATUS_PRIORITY  = {c: v.get('priority', 0) for c, v in statuses.items()}
+    DEFAULT_IGNORE   = {c for c, v in statuses.items() if v.get('ignore')}
+    PROJECT_STATUSES = {c for c, v in statuses.items() if v.get('project')}
+
+    vault = data.get('vault', {})
+    DAILY_FOLDER  = vault.get('daily_folder', '')
+    WEEKLY_FOLDER = vault.get('weekly_folder', '')
 
 WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
 
@@ -87,11 +210,13 @@ def _parse_obsidian(file_path, day_index):
 
 def _parse_lines(d, day_index):
     """Yield (base, status, day_index) records from one daily note."""
-    yield from _parse_obsidian(f'01 Daily/{d}', day_index)
+    path = f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
+    yield from _parse_obsidian(path, day_index)
 
 def _parse_weekly_file(week_label, day_index):
     """Yield (base, status, day_index) records from one weekly planning file."""
-    yield from _parse_obsidian(f'02 Weekly/{week_label}', day_index)
+    path = f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
+    yield from _parse_obsidian(path, day_index)
 
 def cluster_records(records):
     """Cluster records by is_same_task using union-find. Returns list of clusters
@@ -245,12 +370,17 @@ parser.add_argument('-F', '--full-week',  action='store_true',
                     help='expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
+parser.add_argument('--config',           type=str, default=None,
+                    help='path to status config TOML; default resolution: $TDIFF_CONFIG, '
+                         '$XDG_CONFIG_HOME/tdiff/config.toml, or ~/.config/tdiff/config.toml')
 
 # argparse chokes on bare negative numbers like -1 before we can process them;
 # intercept them and turn them into a safe token first.
 raw = sys.argv[1:]
 safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
 args = parser.parse_args(safe)
+
+load_config(args.config, parser.error)
 
 def restore(s):
     if s.startswith('__NEG__'):
