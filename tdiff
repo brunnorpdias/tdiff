@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import sys, re, os, subprocess, difflib, argparse, tomllib
+import sys, re, os, json, subprocess, difflib, argparse, tomllib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -179,48 +180,127 @@ def _tokens(s):
             out.append(t)
     return out
 
-def is_same_task(a, b):
-    """Predicate: same logical task. Token-set equality, or strict subset sharing first word."""
-    ta, tb = _tokens(a), _tokens(b)
-    sa, sb = set(ta), set(tb)
-    if not sa or not sb:
-        return a == b
-    if sa == sb:
-        return True
-    if (sa < sb or sb < sa) and ta and tb and ta[0] == tb[0]:
-        return True
-    return False
+# ── Reading the vault ─────────────────────────────────────────────────────────
+
+class ObsidianError(Exception):
+    """The obsidian CLI could not be run, or reported an error we can't interpret.
+    `retry` is False for permanent failures (no binary), True for ones that have been
+    observed to be transient (the app briefly busy, a stall, a one-off stderr gripe)."""
+    def __init__(self, msg, retry=True):
+        super().__init__(msg)
+        self.retry = retry
+
+# A note that simply doesn't exist is normal (a day with no note, a week with no
+# planning file) — obsidian reports it on stdout with exit status 0.
+_MISSING_FILE_RE = re.compile(r'^Error: File "[^"]*" not found\.$')
+_TASK_RE         = re.compile(r'^- (\[.\]) (.+)$')
+_NEW_PREFIX_RE   = re.compile(r'^\(new\)\s*', re.IGNORECASE)
+
+FETCH_WORKERS    = 8
+OBSIDIAN_TIMEOUT = 30   # seconds per call; generous — only trips on a wedged CLI
+
+_lines_cache = {}
+
+def die(msg):
+    print(f"tdiff: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+def _run_obsidian(file_path):
+    """Return the raw task lines for one vault file, retrying once on a failure that
+    might be transient. Raises ObsidianError if it still can't be trusted."""
+    for attempt in (1, 2):
+        try:
+            return _obsidian_once(file_path)
+        except ObsidianError as e:
+            if not e.retry or attempt == 2:
+                raise
+
+def _obsidian_once(file_path):
+    """One `obsidian tasks` call. Raises ObsidianError if the CLI is missing or its
+    output isn't something we can trust."""
+    argv = ['obsidian', 'tasks', f'file={file_path}']
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=OBSIDIAN_TIMEOUT)
+    except FileNotFoundError:
+        raise ObsidianError(
+            "the 'obsidian' CLI was not found on PATH — tdiff reads the vault through it",
+            retry=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ObsidianError(
+            f"'obsidian tasks file={file_path}' timed out after {OBSIDIAN_TIMEOUT}s "
+            f"(is Obsidian running with the vault open?)"
+        )
+    except OSError as e:
+        raise ObsidianError(f"could not run 'obsidian': {e}")
+
+    out, err = result.stdout, result.stderr.strip()
+    if result.returncode != 0:
+        detail = err or out.strip()
+        first = detail.splitlines()[0] if detail else '(no output)'
+        raise ObsidianError(f"'obsidian tasks file={file_path}' exited {result.returncode}: {first}")
+
+    lines = out.splitlines()
+    if len(lines) == 1 and _MISSING_FILE_RE.match(lines[0].strip()):
+        return []
+    for line in lines:
+        if line.startswith('Error:'):
+            raise ObsidianError(f"obsidian could not read {file_path!r}: {line}")
+    if not out.strip() and err:
+        raise ObsidianError(f"obsidian returned no tasks for {file_path!r}: {err.splitlines()[0]}")
+    return lines
+
+def obsidian_lines(file_path):
+    """Memoized task lines for one vault file."""
+    if file_path not in _lines_cache:
+        try:
+            _lines_cache[file_path] = _run_obsidian(file_path)
+        except ObsidianError as e:
+            die(str(e))
+    return _lines_cache[file_path]
+
+def prefetch(paths):
+    """Warm the line cache for several vault files at once. Each obsidian call is
+    mostly waiting on the app, so overlapping them is a large win for week modes."""
+    todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
+    if len(todo) < 2:
+        for p in todo:
+            obsidian_lines(p)
+        return
+    with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
+        futures = [(p, ex.submit(_run_obsidian, p)) for p in todo]
+    try:
+        for p, fut in futures:
+            _lines_cache[p] = fut.result()
+    except ObsidianError as e:
+        die(str(e))
 
 def _parse_obsidian(file_path, day_index):
     """Yield (base, status, day_index) records from one obsidian file path."""
-    result = subprocess.run(
-        f"obsidian tasks file='{file_path}' | rg -Fv '#routine'",
-        shell=True, capture_output=True, text=True
-    )
-    for line in result.stdout.splitlines():
-        m = re.match(r'^- (\[.\]) (.+)$', line.rstrip())
+    for line in obsidian_lines(file_path):
+        if '#routine' in line:
+            continue
+        m = _TASK_RE.match(line.rstrip())
         if not m:
             continue
         status, full_name = m.group(1), m.group(2)
         full_name = full_name.replace('\\[', '[').replace('\\]', ']')
         full_name = normalize_wikilinks(full_name)
         base = strip_section_suffix(full_name)
-        base = re.sub(r'^\(new\)\s*', '', base, flags=re.IGNORECASE)
+        base = _NEW_PREFIX_RE.sub('', base)
         yield base, status, day_index
 
-def _parse_lines(d, day_index):
-    """Yield (base, status, day_index) records from one daily note."""
-    path = f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
-    yield from _parse_obsidian(path, day_index)
+def daily_path(d):
+    return f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
 
-def _parse_weekly_file(week_label, day_index):
-    """Yield (base, status, day_index) records from one weekly planning file."""
-    path = f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
-    yield from _parse_obsidian(path, day_index)
+def weekly_path(week_label):
+    return f'{WEEKLY_FOLDER}/{week_label}' if WEEKLY_FOLDER else week_label
 
 def cluster_records(records):
-    """Cluster records by is_same_task using union-find. Returns list of clusters
-    (each a list of records) in first-seen order of their root base."""
+    """Cluster records that name the same logical task, using union-find. Two bases
+    are the same task when their token sets are equal, or when one is a strict subset
+    of the other and both start with the same token. Returns a list of clusters (each
+    a list of records) in first-seen order of their root base."""
     bases_in_order, seen = [], set()
     for base, _, _ in records:
         if base not in seen:
@@ -238,10 +318,26 @@ def cluster_records(records):
         if ra != rb:
             parent[ra] = rb
 
-    for i, a in enumerate(bases_in_order):
-        for b in bases_in_order[i + 1:]:
-            if is_same_task(a, b):
-                union(a, b)
+    # Bucketing on the two merge keys gives the same clusters as an all-pairs scan
+    # without tokenizing (or comparing) every pair. Tokenless bases could only merge
+    # by exact string equality, which distinct bases never satisfy — so skip them.
+    by_tokens, by_first = {}, {}
+    for b in bases_in_order:
+        toks = _tokens(b)
+        if not toks:
+            continue
+        key = frozenset(toks)
+        by_tokens.setdefault(key, []).append(b)
+        by_first.setdefault(toks[0], []).append((b, key))
+
+    for group in by_tokens.values():
+        for b in group[1:]:
+            union(group[0], b)
+    for group in by_first.values():
+        for i, (a, sa) in enumerate(group):
+            for b, sb in group[i + 1:]:
+                if sa < sb or sb < sa:
+                    union(a, b)
 
     by_root = {}
     for rec in records:
@@ -269,9 +365,6 @@ def materialize(clusters):
         occurrences[canonical] = [s for _, s, _ in members]
     return tasks, order, occurrences
 
-def fetch(d):
-    return materialize(cluster_records(list(_parse_lines(d, 0))))
-
 def week_span(d):
     """Return (sunday, saturday, label) for the US-format Sun-Sat week containing d."""
     if isinstance(d, str):
@@ -284,30 +377,45 @@ def week_span(d):
     week_num = ((sun - jan1).days + days_back) // 7 + 1
     return sun, sat, f"{sun.year}-W{week_num:02d}"
 
-def week_records(sunday, exclude=None, exclude_weekly_file=False):
-    """Gather raw (base, status, day_index) records for a Sun-Sat week, without materializing.
+def week_entries(sunday, exclude=None, exclude_weekly_file=False):
+    """(vault_path, day_index) pairs for a Sun-Sat week: the 7 daily notes plus the
+    YYYY-W## planning file at day_index 0 (lowest dedup priority).
     `exclude` (ISO date string): skip that day. `exclude_weekly_file`: omit the weekly file."""
-    _, _, week_label = week_span(sunday)
-    records = []
+    entries = []
     for i in range(7):
         d = (sunday + timedelta(days=i)).isoformat()
         if d == exclude:
             continue
-        records.extend(_parse_lines(d, i))
+        entries.append((daily_path(d), i))
     if not exclude_weekly_file:
-        records.extend(_parse_weekly_file(week_label, day_index=0))
-    return records
+        _, _, week_label = week_span(sunday)
+        entries.append((weekly_path(week_label), 0))
+    return entries
 
-def fetch_week(sunday, exclude=None, exclude_weekly_file=False):
-    """Group 7 daily notes Sun..Sat plus weekly planning file into one virtual note."""
-    return materialize(cluster_records(week_records(sunday, exclude, exclude_weekly_file)))
+def side_entries(side):
+    """(vault_path, day_index) pairs backing one side of a comparison.
+    side: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)"""
+    kind, key = side
+    if kind == 'week':
+        sun, exclude_day, exclude_wf = key
+        return week_entries(sun, exclude_day, exclude_wf)
+    if kind == 'weekly_file':
+        return [(weekly_path(key), 0)]
+    return [(daily_path(key), 0)]
 
-def fetch_weekly_file(week_label):
-    """Fetch and deduplicate tasks from a single weekly planning file."""
-    return materialize(cluster_records(list(_parse_weekly_file(week_label, day_index=0))))
+def side_records(entries):
+    """Raw (base, status, day_index) records for one side, without materializing."""
+    prefetch([p for p, _ in entries])
+    return [rec for path, day_index in entries for rec in _parse_obsidian(path, day_index)]
 
-def jaccard(a, b):
-    sa, sb = set(a.lower().split()), set(b.lower().split())
+def fetch_side(side):
+    """Group one side's notes into a single virtual note: (tasks, order, occurrences)."""
+    return materialize(cluster_records(side_records(side_entries(side))))
+
+def _tokenset(s):
+    return set(s.lower().split())
+
+def jaccard(sa, sb):
     if not sa and not sb:
         return 1.0
     return len(sa & sb) / len(sa | sb)
@@ -323,11 +431,20 @@ def prefix_sim(a, b):
     return (2 * first.size) / (len(a) + len(b))
 
 def best_match(name, candidates):
+    """Closest candidate above the similarity threshold, or None.
+    `candidates` is a list of (name, tokenset) pairs; ties go to the earlier one."""
+    na, la = _tokenset(name), len(name)
+    first_char = name[:1].lower()
     best, best_score = None, 0
-    for c in candidates:
-        j = jaccard(name, c)
-        p = prefix_sim(name, c)
-        score = max(j, p)
+    for c, nc in candidates:
+        score = jaccard(na, nc)
+        # prefix_sim() is the expensive half (difflib) and can only change the
+        # outcome if it beats both this pair's jaccard and the running best. Its
+        # ceiling is 2*min(len)/(sum len), and it is 0 unless the first chars match.
+        if c[:1].lower() == first_char:
+            ceiling = 2 * min(la, len(c)) / (la + len(c))
+            if ceiling > max(score, best_score):
+                score = max(score, prefix_sim(name, c))
         if score > best_score:
             best, best_score = c, score
     if best and best_score >= JACCARD_THRESHOLD:
@@ -365,9 +482,12 @@ parser.add_argument('-S', '--status',     type=str, default=None,
 parser.add_argument('-w', '--week-offset', type=str, default=None,
                     help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
 parser.add_argument('-W', '--no-weekly',  action='store_true',
-                    help='exclude the 02 Weekly/YYYY-W## planning file from -w/-F aggregation')
+                    help='exclude the YYYY-W## weekly planning file from -w/-F aggregation')
 parser.add_argument('-F', '--full-week',  action='store_true',
                     help='expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing')
+parser.add_argument('--json',             action='store_true',
+                    help='emit a machine-readable JSON document instead of text '
+                         '(implies --no-color; --no-summary does not apply)')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
 parser.add_argument('--config',           type=str, default=None,
@@ -585,30 +705,42 @@ def type_match(typ):
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
-use_color = not args.no_color and sys.stdout.isatty()
+use_color = not args.no_color and not args.json and sys.stdout.isatty()
 RED    = '\033[31m' if use_color else ''
 GREEN  = '\033[32m' if use_color else ''
 YELLOW = '\033[33m' if use_color else ''
 DIM    = '\033[2m'  if use_color else ''
 RESET  = '\033[0m'  if use_color else ''
 
+# ── JSON output ───────────────────────────────────────────────────────────────
+
+def side_label(side):
+    """Human-facing name for one side: the date, or the YYYY-W## of a week."""
+    kind, key = side
+    return week_span(key[0])[2] if kind == 'week' else key
+
+def side_json(side):
+    """Describe one side of the comparison, including the vault files it read —
+    which is what actually records -W/-w 0 exclusions."""
+    kind, key = side
+    out = {'kind': kind, 'label': side_label(side)}
+    if kind == 'week':
+        sun, sat, _ = week_span(key[0])
+        out['start'], out['end'] = sun.isoformat(), sat.isoformat()
+    out['files'] = [p for p, _ in side_entries(side)]
+    return out
+
+def emit_json(doc):
+    json.dump(doc, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write('\n')
+
 # ── Dupes mode ───────────────────────────────────────────────────────────────
 
 if args.dupes:
-    _kind, _key = side_a
-    if _kind == 'weekly_file':
-        _raw_records = list(_parse_weekly_file(_key, day_index=0))
-        _label = _key
-    elif _kind == 'week':
-        _sun, _exclude_day, _exclude_wf = _key
-        _raw_records = week_records(_sun, exclude=_exclude_day, exclude_weekly_file=_exclude_wf)
-        _, _, _label = week_span(_sun)
-    else:
-        _raw_records = list(_parse_lines(_key, 0))
-        _label = _key
-    clusters = cluster_records(_raw_records)
+    _label = side_label(side_a)
+    clusters = cluster_records(side_records(side_entries(side_a)))
 
-    found = False
+    dupes = []
     for members in clusters:
         if len(members) <= 1:
             continue
@@ -617,46 +749,83 @@ if args.dupes:
             continue
         if not status_match(winning[1]):
             continue
-        # Group records by base within the cluster
+        # Group records by base within the cluster: one variant per distinct wording.
         by_base = {}
         for base, status, _ in members:
             by_base.setdefault(base, []).append(status)
-        if not found:
+        dupes.append({
+            'status': winning[1],
+            # exact: the same wording repeated ("!!"); otherwise variant wordings ("~~")
+            'exact': len(by_base) == 1,
+            'count': len(members),
+            'variants': [
+                {'name': base, 'count': len(sts), 'statuses': [s[1] for s in sts]}
+                for base, sts in by_base.items()
+            ],
+        })
+
+    if args.json:
+        emit_json({'mode': 'dupes', 'a': side_json(side_a), 'duplicates': dupes})
+        sys.exit(0)
+
+    for i, dupe in enumerate(dupes):
+        if i == 0:
             print(f"{YELLOW}Duplicates:{RESET}")
-            found = True
         else:
             print()
-        marker = RED if len(by_base) == 1 else YELLOW
-        sigil = '!!' if len(by_base) == 1 else '~~'
-        for base, sts in by_base.items():
-            statuses = ', '.join(sts)
-            print(f"  {marker}{sigil} {base}{RESET}  ({len(sts)}×  {statuses})")
+        marker = RED if dupe['exact'] else YELLOW
+        sigil = '!!' if dupe['exact'] else '~~'
+        for variant in dupe['variants']:
+            statuses = ', '.join(f"[{s}]" for s in variant['statuses'])
+            print(f"  {marker}{sigil} {variant['name']}{RESET}  ({variant['count']}×  {statuses})")
 
-    if not found:
+    if not dupes:
         print(f"{DIM}No duplicates found in {_label}.{RESET}")
 
     sys.exit(0)
 
 # ── Diff ──────────────────────────────────────────────────────────────────────
 
-def load(side):
-    kind, key = side
-    if kind == 'week':
-        sun, exclude_day, exclude_wf = key
-        return fetch_week(sun, exclude=exclude_day, exclude_weekly_file=exclude_wf)
-    if kind == 'weekly_file':
-        return fetch_weekly_file(key)
-    return fetch(key)
+# One batched read for both sides, so every vault call overlaps.
+prefetch([p for side in (side_a, side_b) for p, _ in side_entries(side)])
 
-a_tasks, a_order, _ = load(side_a)
-b_tasks, b_order, _ = load(side_b)
+a_tasks, a_order, _ = fetch_side(side_a)
+b_tasks, b_order, _ = fetch_side(side_b)
 
 a_names = set(a_tasks)
 b_names = set(b_tasks)
 
 # Types: 0=deleted, 1=added, 2=changed, 3=same
-# Tuples: (sort_key, type, display_string, eff_status_char)
-# eff_status_char: B's status for added/changed/same; A's status for deleted.
+# Rows are (sort_key, type, row_dict); row_dict is both the JSON record and what
+# render() turns into a text line, so the two output modes can't drift apart.
+#   name        canonical task name (A's for deleted/changed, B's for added)
+#   status      effective status char — B's for added/changed/same, A's for deleted
+#   old_status  A's status char (changed rows only)
+#   new_name    B's name (changed rows only, and only when the fuzzy match renamed it)
+TYPE_NAMES = {0: 'deleted', 1: 'added', 2: 'changed', 3: 'same'}
+
+def row(typ, name, status, old_status=None, new_name=None):
+    r = {'type': TYPE_NAMES[typ], 'name': name, 'status': status}
+    if old_status is not None:
+        r['old_status'] = old_status
+    if new_name is not None:
+        r['new_name'] = new_name
+    return (name, typ, r)
+
+def render(r):
+    st = f"[{r['status']}]"
+    typ = r['type']
+    if typ == 'same':
+        return f"{DIM}== {st}  {r['name']}{RESET}"
+    if typ == 'deleted':
+        return f"{RED}-- {st}  {r['name']}{RESET}"
+    if typ == 'added':
+        return f"{GREEN}++ {st}  {r['name']}{RESET}"
+    old = f"[{r['old_status']}]"
+    if 'new_name' in r:
+        return f"{YELLOW}~~ {old} {r['name']} → {st} {r['new_name']}{RESET}"
+    return f"{YELLOW}~~ {old} → {st}  {r['name']}{RESET}"
+
 output = []
 
 used_b = set()
@@ -667,42 +836,41 @@ for name in a_names & b_names:
     used_a.add(name)
     used_b.add(name)
     if a_tasks[name] != b_tasks[name]:
-        eff = b_tasks[name][1]
-        output.append((name, 2, f"{YELLOW}~~ {a_tasks[name]} → {b_tasks[name]}  {name}{RESET}", eff))
+        output.append(row(2, name, b_tasks[name][1], old_status=a_tasks[name][1]))
     else:
-        eff = a_tasks[name][1]
-        output.append((name, 3, f"{DIM}== {a_tasks[name]}  {name}{RESET}", eff))
+        output.append(row(3, name, a_tasks[name][1]))
 
 # Pass 2: fuzzy match remaining
 remaining_a = [n for n in a_order if n not in used_a]
 remaining_b = [n for n in b_order if n not in used_b]
+# Candidates carry their token sets so pass 2 tokenizes each name once, not once
+# per comparison; matched entries are dropped instead of re-filtered every round.
+candidates = [(n, _tokenset(n)) for n in remaining_b]
 
 for a_name in remaining_a:
-    match = best_match(a_name, [n for n in remaining_b if n not in used_b])
+    match = best_match(a_name, candidates)
     if match:
         used_a.add(a_name)
         used_b.add(match)
-        a_s, b_s = a_tasks[a_name], b_tasks[match]
-        eff = b_s[1]
-        if a_name == match:
-            output.append((a_name, 2, f"{YELLOW}~~ {a_s} → {b_s}  {a_name}{RESET}", eff))
-        else:
-            output.append((a_name, 2, f"{YELLOW}~~ {a_s} {a_name} → {b_s} {match}{RESET}", eff))
+        candidates = [pair for pair in candidates if pair[0] != match]
+        output.append(row(2, a_name, b_tasks[match][1],
+                          old_status=a_tasks[a_name][1],
+                          new_name=match if match != a_name else None))
     else:
-        eff = a_tasks[a_name][1]
-        output.append((a_name, 0, f"{RED}-- {a_tasks[a_name]}  {a_name}{RESET}", eff))
+        output.append(row(0, a_name, a_tasks[a_name][1]))
 
 for b_name in remaining_b:
     if b_name not in used_b:
-        eff = b_tasks[b_name][1]
-        output.append((b_name, 1, f"{GREEN}++ {b_tasks[b_name]}  {b_name}{RESET}", eff))
+        output.append(row(1, b_name, b_tasks[b_name][1]))
 
 output.sort(key=lambda x: (x[1] == 3, x[0].lower()))
 
-# ── Filter & print ────────────────────────────────────────────────────────────
+# ── Filter ────────────────────────────────────────────────────────────────────
 
 counts = {0: 0, 1: 0, 2: 0, 3: 0}
-for _, typ, line, eff in output:
+kept = []
+for _, typ, r in output:
+    eff = r['status']
     if eff in PROJECT_STATUSES:          # structural: always excluded, any row
         continue
     if args.ignore and typ in (0, 3) and eff in DEFAULT_IGNORE:
@@ -712,9 +880,28 @@ for _, typ, line, eff in output:
     if not type_match(typ):            # -T: show only matching row types
         continue
     counts[typ] += 1
-    print(line)
+    kept.append(r)
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Output ────────────────────────────────────────────────────────────────────
+
+if args.json:
+    emit_json({
+        'mode': 'diff',
+        'a': side_json(side_a),
+        'b': side_json(side_b),
+        'rows': kept,
+        'summary': {
+            'added':   counts[1],
+            'deleted': counts[0],
+            'changed': counts[2],
+            'same':    counts[3],
+            'total':   sum(counts.values()),
+        },
+    })
+    sys.exit(0)
+
+for r in kept:
+    print(render(r))
 
 if not args.no_summary:
     total = sum(counts.values())
