@@ -24,139 +24,121 @@ def strip_section_suffix(s):
 # Populated by load_config() once args are parsed. Placeholder empty values here
 # so nothing explodes if referenced before load_config() runs.
 STATUS_PRIORITY  = {}
-DEFAULT_IGNORE   = set()
+SETTLED_STATUSES = set()
+HIDDEN_STATUSES  = set()
 PROJECT_STATUSES = set()
 DAILY_FOLDER  = ''
 WEEKLY_FOLDER = ''
+CONFIG_FOUND  = False
 
-DEFAULT_CONFIG_TOML = '''\
-# tdiff status configuration
-# Each [statuses.X] table describes one task-status character (the char inside
-# "[ ]" in a task line).
-#   priority = <int>  dedup precedence when a task appears multiple times
-#                     (higher wins; ties break by most recent day).
-#                     Chars omitted here default to priority 0.
-#   ignore   = true   hidden by -I/--ignore on the settled (A) side of a diff
-#   project  = true   structural marker; always excluded from every output
-#
-# This file is loaded as the complete status table — a status char not listed
-# here falls back to priority 0 / ignore false / project false.
+# Set from --routines once args are parsed; read by _parse_obsidian() at call time.
+INCLUDE_ROUTINES = False
 
-[statuses.x]
-name = "done"
-priority = 5
-ignore = true
+# Complaints worth making but not worth interrupting for. Collected during the run
+# and flushed to stderr at the end by flush_notices(), so they never interleave with
+# the rows on stdout. Suppressed under --json and --no-summary, both of which mean
+# "output with nothing around it".
+NOTICES = []
 
-[statuses."-"]
-name = "cancelled"
-priority = 4
-ignore = true
+def notice(msg):
+    NOTICES.append(msg)
 
-[statuses."!"]
-name = "urgent"
-priority = 3
+def _merge(base, overlay):
+    """Recursive dict merge; the overlay wins.
 
-[statuses."*"]
-name = "important"
-priority = 3
+    Lists replace wholesale rather than concatenating: an overlay that names a
+    partial [dedup].priority means exactly those tiers, not an insertion into a
+    lower layer's list.
+    """
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v
 
-[statuses." "]
-name = "task"
-priority = 3
+def _xdg_base():
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    return Path(xdg) if xdg else Path.home() / '.config'
 
-[statuses."#"]
-name = "blocked / waiting"
-priority = 3
+def config_paths(override):
+    """Every config source, lowest precedence first.
 
-[statuses.o]
-name = "recurrent"
-priority = 3
+    The status table describes the vault's notation, not this tool, so its home is
+    obsidian-tasks/ — a directory neither tdiff nor tcat owns, which is what lets the
+    two share one table without either depending on the other being installed. tdiff's
+    own directory is an optional overlay for tdiff-only settings.
 
-[statuses."/"]
-name = "partial"
-priority = 2
-
-[statuses."&"]
-name = "overrun"
-priority = 1
-ignore = true
-
-[statuses."»"]
-name = "postponed"
-priority = 1
-ignore = true
-
-[statuses."«"]
-name = "advanced"
-priority = 1
-ignore = true
-
-[statuses.">"]
-name = "current"
-priority = 1
-
-[statuses."="]
-name = "paused / switch"
-priority = 1
-
-[statuses."~"]
-name = "snoozed"
-priority = 1
-
-[statuses.p]
-name = "project"
-project = true
-
-[statuses.i]
-name = "important project"
-project = true
-
-[statuses.u]
-name = "urgent project"
-project = true
-
-[vault]
-# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
-# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
-daily_folder = ""
-weekly_folder = ""
-'''
-
-def config_path(override):
-    if override:
-        return Path(override)
+    Each source *merges* over the ones below it, including $TDIFF_CONFIG and --config.
+    A partial file must never erase what a lower layer set: --config used to be a
+    wholesale replacement, so pointing it at a file with no `statuses` table silently
+    zeroed every priority and disabled both -I and the project exclusion.
+    """
+    base = _xdg_base()
+    paths = [base / 'obsidian-tasks' / 'statuses.toml',
+             base / 'tdiff' / 'config.toml']
     env = os.environ.get('TDIFF_CONFIG')
     if env:
-        return Path(env)
-    xdg = os.environ.get('XDG_CONFIG_HOME')
-    base = Path(xdg) if xdg else Path.home() / '.config'
-    return base / 'tdiff' / 'config.toml'
+        paths.append(Path(env))
+    if override:
+        paths.append(Path(override))
+    return paths
 
 def load_config(override, error):
-    """Load status/vault config from TOML, bootstrapping a default file on first run.
-    Populates the module-level STATUS_PRIORITY, DEFAULT_IGNORE, PROJECT_STATUSES,
-    DAILY_FOLDER, WEEKLY_FOLDER globals. `error` is a callable(msg) for fatal errors."""
-    global STATUS_PRIORITY, DEFAULT_IGNORE, PROJECT_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER
-    path = config_path(override)
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_CONFIG_TOML)
-        print(f"tdiff: created default config at {path}", file=sys.stderr)
-    try:
-        with path.open('rb') as f:
-            data = tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        error(f"invalid config at {path}: {e}")
+    """Merge every config layer and populate the module-level globals.
+
+    Never bootstraps a file. Unlike tcat, tdiff cannot run usefully with no config at
+    all — an empty PROJECT_STATUSES leaks project headers into every diff — so no
+    layers at all is a hard error. A layer that exists but omits a section degrades
+    with a notice instead.
+
+    [theme.*] is read by tcat and deliberately ignored here: in tdiff the diff type
+    owns the row colour, so a status colour would have nothing to paint.
+    """
+    global STATUS_PRIORITY, SETTLED_STATUSES, HIDDEN_STATUSES, PROJECT_STATUSES
+    global DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
+
+    merged = {}
+    for path in config_paths(override):
+        if not path.exists():
+            continue
+        try:
+            with path.open('rb') as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            error(f'invalid config at {path}: {e}')
+            return
+        CONFIG_FOUND = True
+        _merge(merged, data)
+
+    if not CONFIG_FOUND:
+        error('no status config found — install statuses.example.toml to '
+              f'{_xdg_base() / "obsidian-tasks" / "statuses.toml"}')
         return
 
-    statuses = data.get('statuses', {})
-    STATUS_PRIORITY  = {c: v.get('priority', 0) for c, v in statuses.items()}
-    DEFAULT_IGNORE   = {c for c, v in statuses.items() if v.get('ignore')}
-    PROJECT_STATUSES = {c for c, v in statuses.items() if v.get('project')}
+    # Tiers, highest precedence first; the inner list is how ties get expressed.
+    # tcat's [order].statuses is a flat list and cannot express them — and means the
+    # opposite anyway (it sorts `x` last for display; here `x` ranks highest for
+    # dedup), which is why the two keys stay separate rather than being merged.
+    tiers = merged.get('dedup', {}).get('priority', [])
+    STATUS_PRIORITY = {c: len(tiers) - i for i, tier in enumerate(tiers) for c in tier}
+    if not STATUS_PRIORITY:
+        notice('no [dedup] priority in config — dedup will pick an arbitrary status '
+               'when a task appears more than once')
 
-    vault = data.get('vault', {})
+    roles = merged.get('roles', {})
+    PROJECT_STATUSES = set(roles.get('project', []))
+    SETTLED_STATUSES = set(roles.get('settled', []))
+    HIDDEN_STATUSES  = set(roles.get('hide', []))
+    if not PROJECT_STATUSES:
+        notice('no [roles] project in config — project rows will not be excluded')
+
+    vault = merged.get('vault', {})
     DAILY_FOLDER  = vault.get('daily_folder', '')
     WEEKLY_FOLDER = vault.get('weekly_folder', '')
+
+def flush_notices():
+    for m in NOTICES:
+        print(f'tdiff: {m}', file=sys.stderr)
 
 WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
 
@@ -313,29 +295,31 @@ def prefetch(paths):
     todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
     if not todo:
         return
-    notice = threading.Timer(SLOW_NOTICE_AFTER, sys.stderr.write,
-                             (f"tdiff: waiting on obsidian ({len(todo)} files)…\n",))
-    notice.daemon = True
-    notice.start()
+    # Named slow_timer, not notice: notice() is the deferred-message function, and a
+    # local of that name here would shadow it for the whole body.
+    slow_timer = threading.Timer(SLOW_NOTICE_AFTER, sys.stderr.write,
+                                 (f"tdiff: waiting on obsidian ({len(todo)} files)…\n",))
+    slow_timer.daemon = True
+    slow_timer.start()
     try:
         if FETCH_WORKERS < 2 or len(todo) < 2:
             for p in todo:
                 obsidian_lines(p)
             return
+        # Both branches go through obsidian_lines() so the vault read has exactly one
+        # seam. Submitting _run_obsidian directly used to leave the memo wrapper
+        # bypassed on the concurrent path — a second entry point that anything hooking
+        # the read would silently miss.
         with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
-            futures = [(p, ex.submit(_run_obsidian, p)) for p in todo]
-        try:
-            for p, fut in futures:
-                _lines_cache[p] = fut.result()
-        except ObsidianError as e:
-            die(str(e))
+            for p in todo:
+                ex.submit(obsidian_lines, p)
     finally:
-        notice.cancel()
+        slow_timer.cancel()
 
 def _parse_obsidian(file_path, day_index):
     """Yield (base, status, day_index) records from one obsidian file path."""
     for line in obsidian_lines(file_path):
-        if '#routine' in line:
+        if '#routine' in line and not INCLUDE_ROUTINES:
             continue
         m = _TASK_RE.match(line.rstrip())
         if not m:
@@ -456,8 +440,9 @@ def week_entries(sunday, exclude=None, exclude_weekly_file=False):
     return entries
 
 def side_entries(side):
-    """(vault_path, day_index) pairs backing one side of a comparison.
-    side: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)"""
+    """(vault_path, day_index) pairs backing one vault side of a comparison.
+    side: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
+    Not defined for ('extern', cmd), which reads nothing from the vault."""
     kind, key = side
     if kind == 'week':
         sun, exclude_day, exclude_wf = key
@@ -466,14 +451,79 @@ def side_entries(side):
         return [(weekly_path(key), 0)]
     return [(daily_path(key), 0)]
 
-def side_records(entries):
+def side_records(side):
     """Raw (base, status, day_index) records for one side, without materializing."""
+    if side[0] == 'extern':
+        return extern_records(side[1])
+    entries = side_entries(side)
     prefetch([p for p, _ in entries])
     return [rec for path, day_index in entries for rec in _parse_obsidian(path, day_index)]
 
 def fetch_side(side):
     """Group one side's notes into a single virtual note: (tasks, order, occurrences)."""
-    return materialize(cluster_records(side_records(side_entries(side))))
+    return materialize(cluster_records(side_records(side)))
+
+# ── External task sets (-E) ───────────────────────────────────────────────────
+#
+# A side can come from a command instead of the vault, which is what makes
+# plan-vs-actual reachable: `tdiff -E 'tcat today -P' 'tcat today -I'`. tdiff has no
+# idea how to read a weekly note's Actio allocation, and shouldn't — tcat already
+# does, and this is the seam where its answer becomes one side of a diff.
+
+_EXTERN_LINE_RE = re.compile(r'^\s*(?:- )?(\[.\]) (.+)$')
+
+def _extern_clean(name):
+    """Normalize an external task name the same way a vault line is normalized, so
+    both sides of a diff are compared on equal terms."""
+    name = name.replace('\\[', '[').replace('\\]', ']')
+    return _NEW_PREFIX_RE.sub('', strip_section_suffix(normalize_wikilinks(name)))
+
+def _extern_tasks(payload):
+    """Yield (status_char, name) from a parsed JSON payload — either tcat's envelope
+    {"tasks": [...]} or a bare list of {"status", "name"}. Project children are
+    flattened to top level; the project headers themselves carry a project status and
+    are dropped downstream like any other."""
+    tasks = payload.get('tasks', []) if isinstance(payload, dict) else payload
+    for t in tasks:
+        yield t.get('status', ' '), t.get('name', '')
+        for kid in (t.get('children') or []):
+            yield kid.get('status', ' '), kid.get('name', '')
+
+def extern_records(cmd):
+    """Run `cmd` and turn its task list into (base, status, day_index) records.
+
+    `--json` is appended when the command doesn't already ask for it, so the common
+    case reads as the command you'd type by hand. Output is parsed as JSON, falling
+    back to `- [c] name` / `  [c] name` lines when it isn't — which makes any task
+    emitter usable here, not just tcat.
+    """
+    if '--json' not in cmd:
+        cmd = f'{cmd} --json'
+    try:
+        # stdin=DEVNULL for the same reason the obsidian reader uses it: a child that
+        # drains stdin would silently eat whatever is piped into the calling script.
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+    except OSError as e:
+        die(f'could not run {cmd!r}: {e}')
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip().splitlines()
+        die(f'{cmd!r} exited {r.returncode}' + (f': {detail[0]}' if detail else ''))
+
+    try:
+        pairs = list(_extern_tasks(json.loads(r.stdout)))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pairs = [(m.group(1)[1], m.group(2))
+                 for line in r.stdout.splitlines()
+                 if (m := _EXTERN_LINE_RE.match(line.rstrip()))]
+
+    # day_index 0 for everything. An external list has already been deduplicated by
+    # whatever produced it, and tcat's ordering is alphabetical rather than
+    # chronological, so position carries no date meaning to tie-break on — let
+    # STATUS_PRIORITY alone decide. Statuses are stored bracketed ('[x]', not 'x')
+    # because that is what every consumer downstream indexes into.
+    return [(_extern_clean(name), f'[{status}]', 0)
+            for status, name in pairs if name]
 
 def _tokenset(s):
     return set(s.lower().split())
@@ -520,8 +570,10 @@ parser = argparse.ArgumentParser(
     prog='tdiff',
     description='Compare tasks between two Obsidian daily notes.',
     epilog=(
-        'Dates accept YYYY-MM-DD, "today", "yesterday", "0" (today), -N (e.g. -1 for yesterday), '
-        'or w## / w2026-W## for a weekly planning file (e.g. w20 = week 20 of the current year). '
+        'Dates accept YYYY-MM-DD, "today", "yesterday", "tomorrow", "0" (today), -N / +N '
+        '(e.g. -1 for yesterday), a weekday name (monday..sunday, or mon..sun), which '
+        'resolves to its most recent occurrence at or before today, or w## / w2026-W## '
+        'for a weekly planning file (e.g. w20 = week 20 of the current year). '
         'Use -o N to compare the anchor with anchor + N days; N may be negative.'
     ),
 )
@@ -534,8 +586,10 @@ parser.add_argument('-T', '--types',      type=str, default=None,
                          "with same-status rows grouped at the bottom.")
 parser.add_argument('-D', '--dupes',      action='store_true', help='find duplicate tasks in a single date')
 parser.add_argument('-I', '--ignore',     action='store_true',
-                    help='hide terminal-status tasks (done, cancelled, overrun, postponed, advanced) '
-                         'on the A side (deleted/unchanged rows); added and changed rows are always shown')
+                    help='hide settled tasks — the statuses named by [roles] settled '
+                         '(done, cancelled, overrun, postponed, advanced) — on the A side '
+                         '(deleted/unchanged rows); added and changed rows are always shown. '
+                         'Composes with -S, which wins for any status it names outright')
 parser.add_argument('-o', '--offset',     type=str, default=None,
                     help='compare anchor (date_a) with date_a + N days; N may be negative')
 parser.add_argument('-S', '--status',     type=str, default=None,
@@ -548,14 +602,21 @@ parser.add_argument('-W', '--no-weekly',  action='store_true',
                     help='exclude the YYYY-W## weekly planning file from -w/-F aggregation')
 parser.add_argument('-F', '--full-week',  action='store_true',
                     help='expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing')
+parser.add_argument('-E', '--exec',       action='store_true', dest='exec_mode',
+                    help='read both positionals as shell commands emitting tasks, rather '
+                         "than as dates (e.g. tdiff -E 'tcat today -P' 'tcat today -I' to "
+                         'compare the day\'s plan against what is still open). --json is '
+                         'appended to each command unless it already asks for it')
+parser.add_argument('--routines',         action='store_true', help='include #routine tasks')
 parser.add_argument('--json',             action='store_true',
                     help='emit a machine-readable JSON document instead of text '
                          '(implies --no-color; --no-summary does not apply)')
 parser.add_argument('--no-color',         action='store_true', help='disable colored output')
 parser.add_argument('--no-summary',       action='store_true', help='suppress the summary line')
 parser.add_argument('--config',           type=str, default=None,
-                    help='path to status config TOML; default resolution: $TDIFF_CONFIG, '
-                         '$XDG_CONFIG_HOME/tdiff/config.toml, or ~/.config/tdiff/config.toml')
+                    help='additional (merging) config layer, applied last; the layers below '
+                         'it are ~/.config/obsidian-tasks/statuses.toml, '
+                         '~/.config/tdiff/config.toml, then $TDIFF_CONFIG')
 
 # argparse chokes on bare negative numbers like -1 before we can process them;
 # intercept them and turn them into a safe token first.
@@ -564,36 +625,54 @@ safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
 args = parser.parse_args(safe)
 
 load_config(args.config, parser.error)
+INCLUDE_ROUTINES = args.routines
 
 def restore(s):
     if s.startswith('__NEG__'):
         return '-' + s[7:]
     return s
 
-_ISO_RE       = re.compile(r'\d{4}-\d{2}-\d{2}')
-_NEG_RE       = re.compile(r'-(\d+)')
+_ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
+_OFF_RE = re.compile(r'([-+])(\d+)')
+
+# One line each so tools/check-core-sync.sh, which compares constants by their
+# assignment line, actually covers them. Both the full name and its 3-letter prefix
+# map to the same index.
+_WEEKDAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+WEEKDAYS = {n[:k]: i for i, n in enumerate(_WEEKDAY_NAMES) for k in (3, len(n))}
+
 _WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
 _WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
 
 def resolve_date(s):
-    if s == 'today' or s == '0':
-        return date.today().isoformat()
+    today = date.today()
+    if s in ('today', '0'):
+        return today.isoformat()
     if s == 'yesterday':
-        return (date.today() - timedelta(days=1)).isoformat()
-    m = _NEG_RE.fullmatch(s)
+        return (today - timedelta(days=1)).isoformat()
+    if s == 'tomorrow':
+        return (today + timedelta(days=1)).isoformat()
+    low = s.lower()
+    if low in WEEKDAYS:
+        # Backwards: the most recent occurrence at or before today. A future day
+        # has no tasks yet, so resolving forwards would always come back empty.
+        days_back = (today.weekday() - WEEKDAYS[low]) % 7
+        return (today - timedelta(days=days_back)).isoformat()
+    m = _OFF_RE.fullmatch(s)
     if m:
-        n = int(m.group(1))
+        n = int(m.group(2))
         if n < 1:
             parser.error(f"invalid date: {s!r} (use 0 for today)")
-        return (date.today() - timedelta(days=n)).isoformat()
+        delta = -n if m.group(1) == '-' else n
+        return (today + timedelta(days=delta)).isoformat()
     if _ISO_RE.fullmatch(s):
         try:
             return date.fromisoformat(s).isoformat()
         except ValueError:
             parser.error(f"invalid date: {s!r}")
     parser.error(
-        f"invalid date: {s!r} "
-        f"(expected YYYY-MM-DD, 'today', 'yesterday', '0', '-N', or 'w##')"
+        f"invalid date: {s!r} (expected YYYY-MM-DD, 'today', 'yesterday', "
+        f"'tomorrow', '0', -N/+N, a weekday name, or w##)"
     )
 
 def resolve_week_label(s):
@@ -651,10 +730,35 @@ raw_b = restore(args.date_b) if args.date_b is not None else None
 week_label_a = resolve_week_label(raw_a)
 week_label_b = resolve_week_label(raw_b) if raw_b is not None else None
 
-# side_a / side_b: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
+# side_a / side_b:
+#   ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
+#   ('extern', command_string)
 side_a = side_b = None
 
-if offset is not None:
+if args.exec_mode:
+    # -E is all-or-nothing: both positionals are commands, or neither is. Mixing a
+    # date with a command is deliberately unsupported — write the date into the
+    # command instead (`tdiff -E 'tcat 2026-07-20' 'tcat today'`), which keeps one
+    # rule for reading a positional rather than two that have to be told apart.
+    for flag, val in (('--offset', args.offset), ('--week-offset', args.week_offset)):
+        if val is not None:
+            parser.error(f"cannot combine --exec with {flag}; put the date arithmetic "
+                         f"in the commands themselves")
+    if args.full_week:
+        parser.error("cannot combine --exec with --full-week; ask the command for a "
+                     "week instead (e.g. 'tcat w30 -A')")
+    if args.no_weekly:
+        parser.error("--no-weekly only applies to -w/--week-offset or -F/--full-week aggregation")
+    if args.dupes:
+        if raw_b is not None:
+            parser.error("--dupes takes one command, not two")
+        side_a = ('extern', raw_a)
+    else:
+        if raw_b is None:
+            parser.error("--exec needs two commands (or one with --dupes)")
+        side_a = ('extern', raw_a)
+        side_b = ('extern', raw_b)
+elif offset is not None:
     if week_label_a:
         parser.error("--offset mode does not support week specifiers (w##)")
     if args.date_b is not None:
@@ -710,11 +814,9 @@ elif week_offset is not None:
     else:
         side_a = anchor_side
         side_b = ('week', week_key)
-    date_b = sun.isoformat()  # kept for any legacy reference; not used by load()
 elif args.date_b is not None:
     side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
     side_b = ('weekly_file', week_label_b) if week_label_b else ('day', resolve_date(raw_b))
-    date_b = raw_b
     if args.full_week:
         side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
         side_b = to_full_week_side(side_b, exclude_weekly_file=args.no_weekly)
@@ -724,12 +826,9 @@ elif not args.dupes:
     parser.error("date_b is required (or use --dupes, --offset N, or --week-offset N)")
 else:
     # dupes mode — anchor may be a day or a weekly file
-    date_b = None
     side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
     if args.full_week:
         side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
-
-ignore_set = PROJECT_STATUSES | (DEFAULT_IGNORE if args.ignore else set())
 
 status_filter = None            # (set_of_chars, negate)
 if args.status is not None:
@@ -748,6 +847,35 @@ def status_match(eff):
     chars, negate = status_filter
     return (eff not in chars) if negate else (eff in chars)
 
+if args.ignore and not SETTLED_STATUSES:
+    notice('-I: no [roles] settled in config — nothing to hide')
+
+def suppressed(eff, typ):
+    """Whether a row is hidden by default, before -S and -T get their say.
+
+    Two rules live here, both from the shared [roles] table: `hide` (never shown at
+    all) and `settled` (shown unless -I). They are checked in one place because they
+    compose with -S under one rule, borrowed from tcat's status_match():
+
+        a positive -S wins outright for the statuses it names.
+
+    So `-S '»'` shows postponed rows even though `hide` lists them, and `-I -S x`
+    shows done rows rather than nothing. A negated -S only says what to drop, so both
+    rules still apply to everything it doesn't name.
+
+    -I is restricted to types 0 and 3 — deleted and same — because those are the rows
+    whose displayed status comes from the settled A side. Added and changed rows are
+    never hidden by it. Dupes mode passes typ=0: there is only one side, and it is
+    the A side.
+    """
+    if status_filter is not None:
+        chars, negate = status_filter
+        if not negate and eff in chars:
+            return False
+    if eff in HIDDEN_STATUSES:
+        return True
+    return args.ignore and typ in (0, 3) and eff in SETTLED_STATUSES
+
 TYPE_CHARS = {'d': 0, 'a': 1, 'c': 2, 's': 3}
 
 type_filter = None      # (set_of_type_ints, negate)
@@ -765,6 +893,26 @@ def type_match(typ):
         return True
     types, negate = type_filter
     return (typ not in types) if negate else (typ in types)
+
+def report_unlisted(seen):
+    """Name status chars this run met that no [dedup] tier ranks.
+
+    They rank 0, which means they lose every dedup tie silently — a status the vault
+    uses but the config forgot is invisible until a task wears it twice.
+    """
+    # Project statuses are excluded from every output, so they never reach a dedup
+    # tie-break and want no rank. Reporting them would be noise on every run.
+    unlisted = sorted(seen - set(STATUS_PRIORITY) - PROJECT_STATUSES)
+    if unlisted and STATUS_PRIORITY:
+        chars = ' '.join(f'[{c}]' for c in unlisted)
+        notice(f'not in [dedup] priority, ranked 0: {chars}')
+
+def finish(code=0):
+    """Exit, flushing notices first. --json and --no-summary both mean 'output with
+    nothing around it', so neither gets them."""
+    if not (args.json or args.no_summary):
+        flush_notices()
+    sys.exit(code)
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -787,6 +935,11 @@ def side_json(side):
     which is what actually records -W/-w 0 exclusions."""
     kind, key = side
     out = {'kind': kind, 'label': side_label(side)}
+    if kind == 'extern':
+        # No `files`: nothing in the vault was read, and the command is the whole
+        # provenance. Naming it is what makes an -E run reproducible from its output.
+        out['command'] = key
+        return out
     if kind == 'week':
         sun, sat, _ = week_span(key[0])
         out['start'], out['end'] = sun.isoformat(), sat.isoformat()
@@ -801,14 +954,16 @@ def emit_json(doc):
 
 if args.dupes:
     _label = side_label(side_a)
-    clusters = cluster_records(side_records(side_entries(side_a)))
+    clusters = cluster_records(side_records(side_a))
 
     dupes = []
     for members in clusters:
         if len(members) <= 1:
             continue
         winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
-        if winning[1] in ignore_set:
+        if winning[1] in PROJECT_STATUSES:
+            continue
+        if suppressed(winning[1], 0):
             continue
         if not status_match(winning[1]):
             continue
@@ -829,7 +984,7 @@ if args.dupes:
 
     if args.json:
         emit_json({'mode': 'dupes', 'a': side_json(side_a), 'duplicates': dupes})
-        sys.exit(0)
+        finish()
 
     for i, dupe in enumerate(dupes):
         if i == 0:
@@ -845,12 +1000,14 @@ if args.dupes:
     if not dupes:
         print(f"{DIM}No duplicates found in {_label}.{RESET}")
 
-    sys.exit(0)
+    finish()
 
 # ── Diff ──────────────────────────────────────────────────────────────────────
 
-# One batched read for both sides, so every vault call overlaps.
-prefetch([p for side in (side_a, side_b) for p, _ in side_entries(side)])
+# One batched read for both sides, so every vault call overlaps. External sides read
+# nothing from the vault, so they contribute no paths.
+prefetch([p for side in (side_a, side_b) if side[0] != 'extern'
+          for p, _ in side_entries(side)])
 
 a_tasks, a_order, _ = fetch_side(side_a)
 b_tasks, b_order, _ = fetch_side(side_b)
@@ -932,18 +1089,22 @@ output.sort(key=lambda x: (x[1] == 3, x[0].lower()))
 
 counts = {0: 0, 1: 0, 2: 0, 3: 0}
 kept = []
+seen_statuses = set()
 for _, typ, r in output:
     eff = r['status']
+    seen_statuses.add(eff)
     if eff in PROJECT_STATUSES:          # structural: always excluded, any row
         continue
-    if args.ignore and typ in (0, 3) and eff in DEFAULT_IGNORE:
-        continue                          # -I: hide only settled A-side (deleted/same) rows
+    if suppressed(eff, typ):           # [roles] hide, and -I on the settled A side
+        continue
     if not status_match(eff):          # -S: show only matching effective statuses
         continue
     if not type_match(typ):            # -T: show only matching row types
         continue
     counts[typ] += 1
     kept.append(r)
+
+report_unlisted(seen_statuses)
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
@@ -961,7 +1122,7 @@ if args.json:
             'total':   sum(counts.values()),
         },
     })
-    sys.exit(0)
+    finish()
 
 for r in kept:
     print(render(r))
@@ -976,3 +1137,5 @@ if not args.no_summary:
         f"{total} total",
     ]
     print('  ' + f"  {DIM}·{RESET}  ".join(parts))
+
+finish()

@@ -1,96 +1,38 @@
-# Reference copy of tdiff's built-in default config — mirrors DEFAULT_CONFIG_TOML
-# in `tdiff`. Not read by tdiff directly: it auto-generates the real config at
-# --config / $TDIFF_CONFIG / $XDG_CONFIG_HOME/tdiff/config.toml / ~/.config/tdiff/config.toml
-# on first run. Copy this file there (or just run tdiff once) to get started,
-# then edit to taste.
-
-# tdiff status configuration
-# Each [statuses.X] table describes one task-status character (the char inside
-# "[ ]" in a task line).
-#   priority = <int>  dedup precedence when a task appears multiple times
-#                     (higher wins; ties break by most recent day).
-#                     Chars omitted here default to priority 0.
-#   ignore   = true   hidden by -I/--ignore on the settled (A) side of a diff
-#   project  = true   structural marker; always excluded from every output
+# tdiff-only settings.
 #
-# This file is loaded as the complete status table — a status char not listed
-# here falls back to priority 0 / ignore false / project false.
+# Install to ~/.config/tdiff/config.toml. Entirely optional: this file is an
+# *overlay* on statuses.example.toml (installed at
+# ~/.config/obsidian-tasks/statuses.toml), not a replacement for it.
+#
+# Layers, lowest precedence first — each merges over the ones below it, so a
+# partial file here never erases what the shared table set:
+#
+#   1. ~/.config/obsidian-tasks/statuses.toml   the shared vault vocabulary
+#   2. ~/.config/tdiff/config.toml              this file
+#   3. $TDIFF_CONFIG
+#   4. --config <path>
+#
+# There is no built-in layer beneath these, and nothing is ever created for you.
+# With none of them present tdiff exits with an error rather than guessing: without
+# [roles] project it would leak project headers into every diff, and without [dedup]
+# it would pick an arbitrary status for any task stated twice.
 
-[statuses.x]
-name = "done"
-priority = 5
-ignore = true
-
-[statuses."-"]
-name = "cancelled"
-priority = 4
-ignore = true
-
-[statuses."!"]
-name = "urgent"
-priority = 3
-
-[statuses."*"]
-name = "important"
-priority = 3
-
-[statuses." "]
-name = "task"
-priority = 3
-
-[statuses."#"]
-name = "blocked / waiting"
-priority = 3
-
-[statuses.o]
-name = "recurrent"
-priority = 3
-
-[statuses."/"]
-name = "partial"
-priority = 2
-
-[statuses."&"]
-name = "overrun"
-priority = 1
-ignore = true
-
-[statuses."»"]
-name = "postponed"
-priority = 1
-ignore = true
-
-[statuses."«"]
-name = "advanced"
-priority = 1
-ignore = true
-
-[statuses.">"]
-name = "current"
-priority = 1
-
-[statuses."="]
-name = "paused / switch"
-priority = 1
-
-[statuses."~"]
-name = "snoozed"
-priority = 1
-
-[statuses.p]
-name = "project"
-project = true
-
-[statuses.i]
-name = "important project"
-project = true
-
-[statuses.u]
-name = "urgent project"
-project = true
 
 [vault]
-# Optional. If set (non-empty), daily/weekly lookups are prefixed with this
-# folder. If empty/omitted (default), files resolve by name anywhere in the vault.
+# Optional. If set (non-empty), daily/weekly lookups are prefixed with this folder.
+# If empty or omitted, files resolve by name anywhere in the vault — which is how
+# `obsidian tasks file=` behaves natively, so leaving these empty is usually right.
 daily_folder = ""
 weekly_folder = ""
+
+
+# Anything from statuses.toml can be overridden here when you want tdiff to differ
+# from the shared table. Lists replace wholesale rather than merging element-wise:
+# naming a partial [dedup].priority means exactly those tiers.
+#
+# [roles]
+# hide = []          # show overrun/postponed/advanced by default
+# settled = ["x"]    # make -I hide only done tasks, not cancelled ones too
+#
+# [dedup]
+# priority = [["x"], ["-"], [" "]]
