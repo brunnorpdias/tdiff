@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, re, os, json, subprocess, difflib, argparse, tomllib
+import sys, re, os, json, time, threading, subprocess, difflib, argparse, tomllib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -184,11 +184,13 @@ def _tokens(s):
 
 class ObsidianError(Exception):
     """The obsidian CLI could not be run, or reported an error we can't interpret.
-    `retry` is False for permanent failures (no binary), True for ones that have been
-    observed to be transient (the app briefly busy, a stall, a one-off stderr gripe)."""
-    def __init__(self, msg, retry=True):
+    `retry` is False for permanent failures (no binary), True for ones observed to be
+    transient. `stalled` marks the timeout case, which is worth telling the user about
+    because it's the only failure they feel as a pause."""
+    def __init__(self, msg, retry=True, stalled=False):
         super().__init__(msg)
         self.retry = retry
+        self.stalled = stalled
 
 # A note that simply doesn't exist is normal (a day with no note, a week with no
 # planning file) — obsidian reports it on stdout with exit status 0.
@@ -196,31 +198,72 @@ _MISSING_FILE_RE = re.compile(r'^Error: File "[^"]*" not found\.$')
 _TASK_RE         = re.compile(r'^- (\[.\]) (.+)$')
 _NEW_PREFIX_RE   = re.compile(r'^\(new\)\s*', re.IGNORECASE)
 
-FETCH_WORKERS    = 8
-OBSIDIAN_TIMEOUT = 30   # seconds per call; generous — only trips on a wedged CLI
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ[name]))
+    except (KeyError, ValueError):
+        return default
+
+# Concurrency is a small win (4 and 8 workers measure the same), so keep it low —
+# the obsidian CLI talks to a single running app. TDIFF_WORKERS=1 forces serial reads.
+FETCH_WORKERS = _env_int('TDIFF_WORKERS', 4)
+
+# Roughly one obsidian call in a few hundred wedges and never returns, at the same
+# rate whether we read serially or concurrently. The wedge is per-invocation — the app
+# keeps answering everything else — so a short deadline plus a fresh call is the cure.
+# A healthy call takes ~10ms (20ms worst of 320 measured), so 1s is ~100x headroom and
+# keeps a stall inside the second this tool should always finish in. A merely slow call
+# is not lost by a tight deadline: the retry catches it.
+OBSIDIAN_TIMEOUT  = _env_int('TDIFF_TIMEOUT', 1)   # seconds per call
+OBSIDIAN_ATTEMPTS = 3
+SLOW_NOTICE_AFTER = 2.5     # seconds before telling the user we're waiting, not hung
+DEBUG = bool(os.environ.get('TDIFF_DEBUG'))
 
 _lines_cache = {}
 
 def die(msg):
-    print(f"tdiff: {msg}", file=sys.stderr)
-    sys.exit(2)
+    """Report a fatal error and leave immediately. os._exit() because a wedged
+    obsidian call can leave a pool thread blocked, and a normal exit would hang
+    joining it."""
+    sys.stdout.flush()
+    sys.stderr.write(f"tdiff: {msg}\n")
+    sys.stderr.flush()
+    os._exit(2)
+
+def _on_uncaught(exc_type, exc, tb):
+    """Ctrl-C should leave at once — without a traceback, and without waiting on
+    reader threads that may be stuck on a slow obsidian call."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.stdout.flush()
+        sys.stderr.write('\ntdiff: interrupted\n')
+        sys.stderr.flush()
+        os._exit(130)
+    sys.__excepthook__(exc_type, exc, tb)
+
+sys.excepthook = _on_uncaught
 
 def _run_obsidian(file_path):
-    """Return the raw task lines for one vault file, retrying once on a failure that
-    might be transient. Raises ObsidianError if it still can't be trusted."""
-    for attempt in (1, 2):
+    """Return the raw task lines for one vault file, retrying a failure that might be
+    transient. Raises ObsidianError once the attempts are spent."""
+    for attempt in range(1, OBSIDIAN_ATTEMPTS + 1):
         try:
             return _obsidian_once(file_path)
         except ObsidianError as e:
-            if not e.retry or attempt == 2:
+            if not e.retry or attempt == OBSIDIAN_ATTEMPTS:
                 raise
+            if e.stalled:
+                sys.stderr.write(f"tdiff: obsidian stalled on {file_path}, retrying\n")
 
 def _obsidian_once(file_path):
     """One `obsidian tasks` call. Raises ObsidianError if the CLI is missing or its
     output isn't something we can trust."""
     argv = ['obsidian', 'tasks', f'file={file_path}']
+    started = time.monotonic()
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=OBSIDIAN_TIMEOUT)
+        # stdin is closed: this is never an interactive call, and a CLI that decided
+        # to read from the terminal would block every reader thread behind it.
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=OBSIDIAN_TIMEOUT)
     except FileNotFoundError:
         raise ObsidianError(
             "the 'obsidian' CLI was not found on PATH — tdiff reads the vault through it",
@@ -228,11 +271,16 @@ def _obsidian_once(file_path):
         )
     except subprocess.TimeoutExpired:
         raise ObsidianError(
-            f"'obsidian tasks file={file_path}' timed out after {OBSIDIAN_TIMEOUT}s "
-            f"(is Obsidian running with the vault open?)"
+            f"'obsidian tasks file={file_path}' produced nothing within "
+            f"{OBSIDIAN_TIMEOUT}s on {OBSIDIAN_ATTEMPTS} attempts — is Obsidian running "
+            f"with the vault open? (TDIFF_TIMEOUT=N raises the limit)",
+            stalled=True,
         )
     except OSError as e:
         raise ObsidianError(f"could not run 'obsidian': {e}")
+
+    if DEBUG:
+        sys.stderr.write(f"tdiff: {time.monotonic() - started:6.3f}s  {file_path}\n")
 
     out, err = result.stdout, result.stderr.strip()
     if result.returncode != 0:
@@ -261,19 +309,28 @@ def obsidian_lines(file_path):
 
 def prefetch(paths):
     """Warm the line cache for several vault files at once. Each obsidian call is
-    mostly waiting on the app, so overlapping them is a large win for week modes."""
+    mostly waiting on the app, so overlapping them is a win for week modes."""
     todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
-    if len(todo) < 2:
-        for p in todo:
-            obsidian_lines(p)
+    if not todo:
         return
-    with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
-        futures = [(p, ex.submit(_run_obsidian, p)) for p in todo]
+    notice = threading.Timer(SLOW_NOTICE_AFTER, sys.stderr.write,
+                             (f"tdiff: waiting on obsidian ({len(todo)} files)…\n",))
+    notice.daemon = True
+    notice.start()
     try:
-        for p, fut in futures:
-            _lines_cache[p] = fut.result()
-    except ObsidianError as e:
-        die(str(e))
+        if FETCH_WORKERS < 2 or len(todo) < 2:
+            for p in todo:
+                obsidian_lines(p)
+            return
+        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(todo))) as ex:
+            futures = [(p, ex.submit(_run_obsidian, p)) for p in todo]
+        try:
+            for p, fut in futures:
+                _lines_cache[p] = fut.result()
+        except ObsidianError as e:
+            die(str(e))
+    finally:
+        notice.cancel()
 
 def _parse_obsidian(file_path, day_index):
     """Yield (base, status, day_index) records from one obsidian file path."""

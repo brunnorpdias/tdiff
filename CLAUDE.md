@@ -31,11 +31,11 @@ No test suite — testing is manual via CLI invocation.
 
 ## Architecture
 
-The entire tool lives in a single executable file: `tdiff` (~915 lines, Python 3).
+The entire tool lives in a single executable file: `tdiff` (~970 lines, Python 3).
 
 The script processes tasks in this pipeline:
 
-1. **Read** — `_run_obsidian()` execs `obsidian tasks file=<name>` directly (no shell, no pipe); `#routine` lines are filtered in Python. Failures are fatal, never silent: a missing `obsidian` binary, a non-zero exit, an unexpected `Error:` line on stdout, or a 30s timeout all print `tdiff: ...` to stderr and exit 2. Only obsidian's `Error: File "X" not found.` is treated as an empty note (days without notes and missing weekly files stay silent). `obsidian_lines()` memoizes per file path and `prefetch()` warms that cache concurrently (`FETCH_WORKERS` threads) — every vault read for both sides of a comparison is issued in one batch, which is where most of the wall-clock went.
+1. **Read** — `_run_obsidian()` execs `obsidian tasks file=<name>` directly (no shell, no pipe); `#routine` lines are filtered in Python. Failures are fatal, never silent: a missing `obsidian` binary, a non-zero exit, an unexpected `Error:` line on stdout, or a stalled call all print `tdiff: ...` to stderr and exit 2. Only obsidian's `Error: File "X" not found.` is treated as an empty note (days without notes and missing weekly files stay silent). `obsidian_lines()` memoizes per file path and `prefetch()` warms that cache concurrently (`FETCH_WORKERS` threads) — every vault read for both sides of a comparison is issued in one batch, which is where most of the wall-clock went. See **Obsidian CLI stalls** below.
 
 2. **Parse** — `_parse_obsidian()` turns those lines into `(base, status, day_index)` records. Project items (statuses `p`, `i`, `u`) are always excluded.
 
@@ -62,6 +62,24 @@ The script processes tasks in this pipeline:
 | `--json` | Emit a JSON document instead of text (implies `--no-color`; `--no-summary` does not apply) |
 | `--no-color` | Disable ANSI colors |
 | `--no-summary` | Suppress summary line |
+
+## Obsidian CLI stalls
+
+Roughly **one `obsidian tasks` call in a few hundred wedges and never returns** — measured at 180s with no output, while sibling calls kept answering in ~10ms. It happens at the same rate reading serially or concurrently (1/480 at 1 worker, 2/480 at 4, 4/480 at 8), so it is not caused by tdiff's threading; concurrency only widens the window because week modes issue 16 calls instead of 2. This is why week/`-F` modes appeared to hang while day-vs-day rarely did.
+
+Because the wedge is **per-invocation** and the app stays healthy, the fix is a short deadline plus a fresh call, not a longer wait:
+
+- `OBSIDIAN_TIMEOUT` (default 1s, `TDIFF_TIMEOUT=N`) — a healthy call is ~10ms (20ms worst of 320 measured), so this is ~100x headroom, and it keeps a stall inside the one second the whole tool should take. A merely slow call isn't lost by the tight deadline; the retry catches it.
+- `OBSIDIAN_ATTEMPTS` (3) — a retry after a stall practically always succeeds. A stall therefore costs ~1s, and only reports `tdiff: obsidian stalled on <file>, retrying` on stderr. Giving up entirely needs all 3 attempts to stall.
+- Other transient failures retry too; a missing binary does not (`ObsidianError.retry`).
+- If reads exceed `SLOW_NOTICE_AFTER` (2.5s), `prefetch()` writes `waiting on obsidian (N files)…` to stderr so slow never looks like hung.
+
+Two related traps, both to do with wedged reads leaving a thread blocked:
+
+- `die()` uses `os._exit()`, and `KeyboardInterrupt` is handled by `_on_uncaught()` which also uses `os._exit(130)`. A plain `sys.exit()` would hang at interpreter shutdown joining the non-daemon pool thread — which is exactly what an interrupted run used to do.
+- Calls pass `stdin=DEVNULL`; a CLI that ever read the terminal would block every reader thread behind it.
+
+Env overrides: `TDIFF_WORKERS` (default 4, `1` = serial), `TDIFF_TIMEOUT` (seconds), `TDIFF_DEBUG=1` (per-call timings on stderr).
 
 ## JSON output
 
