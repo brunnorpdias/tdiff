@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, re, os, json, time, threading, subprocess, difflib, argparse, tomllib
+import sys, re, os, json, time, threading, subprocess, argparse, tomllib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -531,17 +531,16 @@ def _tokenset(s):
 def jaccard(sa, sb):
     if not sa and not sb:
         return 1.0
-    return len(sa & sb) / len(sa | sb)
+    overlap = len(sa & sb)
+    return overlap / (len(sa) + len(sb) - overlap)
 
 def prefix_sim(a, b):
-    matcher = difflib.SequenceMatcher(None, a.lower(), b.lower())
-    blocks = matcher.get_matching_blocks()
-    if not blocks:
-        return 0.0
-    first = blocks[0]
-    if first.a != 0 or first.b != 0:
-        return 0.0
-    return (2 * first.size) / (len(a) + len(b))
+    prefix_len = 0
+    for ca, cb in zip(a.lower(), b.lower()):
+        if ca != cb:
+            break
+        prefix_len += 1
+    return (2 * prefix_len) / (len(a) + len(b))
 
 def best_match(name, candidates):
     """Closest candidate above the similarity threshold, or None.
@@ -550,13 +549,21 @@ def best_match(name, candidates):
     first_char = name[:1].lower()
     best, best_score = None, 0
     for c, nc in candidates:
+        # Neither metric can reach the threshold when the shorter side is too small.
+        # Once a match exists, candidates that can only tie it cannot replace it.
+        token_ceiling = (min(len(na), len(nc)) / max(len(na), len(nc))
+                         if na or nc else 1.0)
+        same_first = c[:1].lower() == first_char
+        prefix_ceiling = (2 * min(la, len(c)) / (la + len(c))) if same_first else 0.0
+        ceiling = max(token_ceiling, prefix_ceiling)
+        if ceiling < JACCARD_THRESHOLD or ceiling <= best_score:
+            continue
+
         score = jaccard(na, nc)
-        # prefix_sim() is the expensive half (difflib) and can only change the
-        # outcome if it beats both this pair's jaccard and the running best. Its
-        # ceiling is 2*min(len)/(sum len), and it is 0 unless the first chars match.
-        if c[:1].lower() == first_char:
-            ceiling = 2 * min(la, len(c)) / (la + len(c))
-            if ceiling > max(score, best_score):
+        # Prefix similarity can only change the outcome when its length-based ceiling
+        # beats both this pair's Jaccard score and the running best.
+        if same_first:
+            if prefix_ceiling > max(score, best_score):
                 score = max(score, prefix_sim(name, c))
         if score > best_score:
             best, best_score = c, score
