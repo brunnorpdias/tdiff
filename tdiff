@@ -142,6 +142,9 @@ def flush_notices():
 
 WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
 
+# A wikilink keeps its brackets and loses only its folder path, so `[[a/b|c]]` reads
+# as `[[b|c]]`. This is what clean_text runs, and what tcat's tools/check-core-sync.sh
+# lists in FUNCS.
 def _strip_wiki_path(m):
     inner = m.group(1)
     if '|' in inner:
@@ -162,6 +165,99 @@ def _tokens(s):
             out.append(t)
     return out
 
+# ── Parsing a note ────────────────────────────────────────────────────────────
+#
+# Vendored verbatim into tcat, which checks it with tools/check-core-sync.sh. Both
+# tools read raw markdown through `obsidian read` and parse it here, so a task has
+# one name and one shape no matter which tool asked. Any change lands in both.
+
+TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
+H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
+H3_RE   = re.compile(r'^###\s+\*(\w+)\*')
+MARK_RE = re.compile(r'^\*{2,3}([a-z]+)\*{2,3}\s*$')
+MDLINK_RE = re.compile(r'\[([^\[\]]+)\]\([^()]*\)')
+
+# The weekly day ladder. A whitelist, never a blacklist — the weekly template
+# gains sections over time, and this is what keeps Ratio's **rationes** lines and
+# Mensis's prospect checkboxes out of every day.
+#
+# WEEK_DAYS is the ladder's day span on its own: -A asks for all seven at once,
+# and deriving LADDER from it keeps the two from drifting apart.
+WEEK_DAYS = ('sunday', 'monday', 'tuesday', 'wednesday',
+             'thursday', 'friday', 'saturday')
+LADDER = ('promissum',) + WEEK_DAYS + ('future',)
+
+def clean_text(s):
+    """Un-escape Obsidian's bracket escapes, drop a trailing ' – ...' section suffix,
+    then shorten wikilink paths and reduce markdown links to their display text.
+
+    **The order is the whole point, and it diverges from tcat.** `strip_section_suffix`
+    only skips a dash it can see is inside brackets, so it has to run while the
+    brackets are still there. tcat reduces links first, which leaves
+    `[[marc randolph on building netflix – tim ferriss (496)]]` looking like prose with
+    a section suffix and truncates it at the dash — 18 of 455 names in this vault, some
+    down to a third of their length. Un-escaping stays first either way, or `\\[\\[foo]]`
+    never registers as bracket depth at all.
+
+    Wikilinks keep their brackets (`normalize_wikilinks` only shortens the path), which
+    is the second divergence: tdiff has always displayed `complete [[2026-W28]]`, and a
+    name is a name whether or not the vault happened to link it. Markdown links do get
+    reduced — that part is new, and without it a name carries a full URL.
+    """
+    s = s.replace('\\[', '[').replace('\\]', ']')
+    s = strip_section_suffix(s)
+    s = normalize_wikilinks(s)
+    return MDLINK_RE.sub(lambda m: m.group(1), s)
+
+def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
+    """Yield (indent, status_char, name, seq) for tasks in a note.
+
+    Fence-agnostic by design: ``` lines are ignored, never toggled. The weekly
+    note's whole Fixa section is itself fenced, so toggling desynchronises. Every
+    `base`/`dataviewjs` block lives under ## *Recensio*, ahead of ### *Actio*.
+
+    region/day: when both are given, only tasks under that ### heading and that
+    ladder marker are yielded (weekly mode). `day` takes one marker name or a
+    tuple of them — WEEK_DAYS folds the whole week into one pass, which is what
+    -A -P wants. When neither is given, every task in the note is yielded (daily
+    mode).
+
+    skip_future: drop tasks sitting under a **future** marker. Only -A passes it.
+    A daily note's future bucket is fair to show for that one day, but aggregating
+    a week would fold deferred work in alongside what actually happened — and a
+    pre-split Sunday's bucket holds a whole week of it.
+    """
+    days = (day,) if isinstance(day, str) else day
+    cur_region = cur_day = None
+    seq = 0
+    for line in lines:
+        if H2_RE.match(line):
+            cur_region = cur_day = None
+            continue
+        m = H3_RE.match(line)
+        if m:
+            cur_region = m.group(1).lower()
+            cur_day = None
+            continue
+        m = MARK_RE.match(line)
+        if m and m.group(1) in LADDER:
+            # Once inside **future**, stay there: a future fence may carry its own
+            # **sunday**/**other** markers that must not re-enter the ladder.
+            if cur_day != 'future':
+                cur_day = m.group(1)
+            continue
+        m = TASK_RE.match(line)
+        if not m:
+            continue
+        if not routines and '#routine' in line:
+            continue
+        if skip_future and cur_day == 'future':
+            continue
+        if region is not None and (cur_region != region or cur_day not in days):
+            continue
+        seq += 1
+        yield len(m.group(1)), m.group(2)[1], clean_text(m.group(3)), seq
+
 # ── Reading the vault ─────────────────────────────────────────────────────────
 
 class ObsidianError(Exception):
@@ -175,9 +271,8 @@ class ObsidianError(Exception):
         self.stalled = stalled
 
 # A note that simply doesn't exist is normal (a day with no note, a week with no
-# planning file) — obsidian reports it on stdout with exit status 0.
+# planning note) — obsidian reports it on stdout with exit status 0.
 _MISSING_FILE_RE = re.compile(r'^Error: File "[^"]*" not found\.$')
-_TASK_RE         = re.compile(r'^- (\[.\]) (.+)$')
 _NEW_PREFIX_RE   = re.compile(r'^\(new\)\s*', re.IGNORECASE)
 
 def _env_int(name, default):
@@ -225,8 +320,8 @@ def _on_uncaught(exc_type, exc, tb):
 sys.excepthook = _on_uncaught
 
 def _run_obsidian(file_path):
-    """Return the raw task lines for one vault file, retrying a failure that might be
-    transient. Raises ObsidianError once the attempts are spent."""
+    """Return the raw markdown lines of one vault file, retrying a failure that might
+    be transient. Raises ObsidianError once the attempts are spent."""
     for attempt in range(1, OBSIDIAN_ATTEMPTS + 1):
         try:
             return _obsidian_once(file_path)
@@ -237,9 +332,15 @@ def _run_obsidian(file_path):
                 sys.stderr.write(f"tdiff: obsidian stalled on {file_path}, retrying\n")
 
 def _obsidian_once(file_path):
-    """One `obsidian tasks` call. Raises ObsidianError if the CLI is missing or its
-    output isn't something we can trust."""
-    argv = ['obsidian', 'tasks', f'file={file_path}']
+    """One `obsidian read` call. Raises ObsidianError if the CLI is missing or its
+    output isn't something we can trust.
+
+    `read` rather than `tasks`: the flat task list `tasks` returns has already
+    thrown away the headings, and the ladder markers under ### *Actio* are the only
+    thing that says which of a weekly note's tasks are the week's plan. tcat has
+    always read raw markdown for that reason; this is the seam where the two tools
+    stopped disagreeing about what a note contains."""
+    argv = ['obsidian', 'read', f'file={file_path}']
     started = time.monotonic()
     try:
         # stdin is closed: this is never an interactive call, and a CLI that decided
@@ -253,7 +354,7 @@ def _obsidian_once(file_path):
         )
     except subprocess.TimeoutExpired:
         raise ObsidianError(
-            f"'obsidian tasks file={file_path}' produced nothing within "
+            f"'obsidian read file={file_path}' produced nothing within "
             f"{OBSIDIAN_TIMEOUT}s on {OBSIDIAN_ATTEMPTS} attempts — is Obsidian running "
             f"with the vault open? (TDIFF_TIMEOUT=N raises the limit)",
             stalled=True,
@@ -268,20 +369,26 @@ def _obsidian_once(file_path):
     if result.returncode != 0:
         detail = err or out.strip()
         first = detail.splitlines()[0] if detail else '(no output)'
-        raise ObsidianError(f"'obsidian tasks file={file_path}' exited {result.returncode}: {first}")
+        raise ObsidianError(f"'obsidian read file={file_path}' exited {result.returncode}: {first}")
 
     lines = out.splitlines()
-    if len(lines) == 1 and _MISSING_FILE_RE.match(lines[0].strip()):
+    if not lines:
+        # An empty note is a legitimately empty side, the same as a missing one.
         return []
-    for line in lines:
-        if line.startswith('Error:'):
-            raise ObsidianError(f"obsidian could not read {file_path!r}: {line}")
+    # Only the *first* line can be an error report. Scanning them all was safe while
+    # this read a task list; on raw markdown a note that happens to open a line with
+    # "Error:" would be misread as a failed read.
+    first = lines[0].strip()
+    if _MISSING_FILE_RE.match(first):
+        return []
+    if first.startswith('Error:'):
+        raise ObsidianError(f"obsidian could not read {file_path!r}: {first}")
     if not out.strip() and err:
-        raise ObsidianError(f"obsidian returned no tasks for {file_path!r}: {err.splitlines()[0]}")
+        raise ObsidianError(f"obsidian returned nothing for {file_path!r}: {err.splitlines()[0]}")
     return lines
 
 def obsidian_lines(file_path):
-    """Memoized task lines for one vault file."""
+    """Memoized markdown lines for one vault file."""
     if file_path not in _lines_cache:
         try:
             _lines_cache[file_path] = _run_obsidian(file_path)
@@ -291,7 +398,11 @@ def obsidian_lines(file_path):
 
 def prefetch(paths):
     """Warm the line cache for several vault files at once. Each obsidian call is
-    mostly waiting on the app, so overlapping them is a win for week modes."""
+    mostly waiting on the app, so overlapping them is a win for week modes.
+
+    `read` returns a whole note where `tasks` returned a handful of lines, so each
+    payload is larger — but the call count is unchanged, and the wait was always
+    the round trip rather than the bytes."""
     todo = [p for p in dict.fromkeys(paths) if p not in _lines_cache]
     if not todo:
         return
@@ -316,20 +427,71 @@ def prefetch(paths):
     finally:
         slow_timer.cancel()
 
-def _parse_obsidian(file_path, day_index):
-    """Yield (base, status, day_index) records from one obsidian file path."""
-    for line in obsidian_lines(file_path):
-        if '#routine' in line and not INCLUDE_ROUTINES:
-            continue
-        m = _TASK_RE.match(line.rstrip())
-        if not m:
-            continue
-        status, full_name = m.group(1), m.group(2)
-        full_name = full_name.replace('\\[', '[').replace('\\]', ']')
-        full_name = normalize_wikilinks(full_name)
-        base = strip_section_suffix(full_name)
-        base = _NEW_PREFIX_RE.sub('', base)
-        yield base, status, day_index
+# How each kind of note is read. The kwargs travel with the note in side_entries(),
+# because what a note means depends on which side asked for it, not on its name.
+#
+# A bare day side reads the whole daily note, future bucket included — it is that one
+# day's own list, and deferring something is part of the day. The same note inside a
+# week aggregation drops **future**, because folding seven days together would
+# otherwise pull deferred work in beside what actually happened, and a pre-split
+# Sunday's bucket holds a whole week of it.
+DAY_MODE      = {}
+WEEK_DAY_MODE = {'skip_future': True}
+
+def weekly_mode(until=None):
+    """Read kwargs for a YYYY-W## weekly note: the ### *Actio* section — the week's
+    plan. The rest of the note (Impressio, Relatio, Cultus, Fixa) is structure and
+    reference, not work assigned to this week, and used to leak into every week diff.
+
+    `None` leads the day whitelist on purpose, and is the one divergence from tcat's
+    -A -P. Actio's seven **weekday** markers are an *optional* second pass: a week is
+    planned by listing tasks under the heading, and only some of them ever get
+    allocated to a named day. On an organised week (W30, W32) every task carries a
+    marker and the `None` entry matches nothing; on a week still being drafted (W31,
+    W33) *everything* sits unallocated, and asking for WEEK_DAYS alone would report an
+    empty plan against a section holding dozens of tasks. Reading the unallocated ones
+    is what lets tdiff see a week you are still writing.
+
+    `until` (ISO date) stops the whitelist strictly before that day's marker, so a
+    week derived from a date anchor covers only what was due ahead of it. Nothing
+    allocated to Thursday is outstanding on Wednesday.
+
+    **future** is excluded either way — it is the deferral bucket, not this week — and
+    the whitelist does that on its own, since 'future' is simply not in the tuple.
+    """
+    days = WEEK_DAYS
+    if until is not None:
+        days = WEEK_DAYS[:(date.fromisoformat(until).weekday() + 1) % 7]
+    return {'region': 'actio', 'day': (None,) + days}
+
+def _parse_obsidian(file_path, day_index, read_kwargs):
+    """Yield (scope_key, scope_name, status, base, status_char, day_index) records.
+
+    A project header — a task at indent 0 whose status is in [roles] project — opens a
+    scope that the indented tasks under it belong to; any other indent-0 task closes it
+    and belongs to the bare scope (`scope_key = None`). The header is context, never a
+    row of its own, so it is not yielded.
+
+    Grouping happens here, inside one note, so a header left open at the end of one
+    note cannot adopt the indented tasks of the next. tcat's build_groups never faces
+    that — it only ever sees a single note — but a tdiff week side concatenates eight.
+
+    Scope keys are lowercased so [[Project Alpha]] and [[project alpha]] are one
+    project; the display name is the first spelling seen.
+    """
+    scope_key = scope_name = scope_status = None
+    for indent, status_char, name, _seq in parse_note(
+            obsidian_lines(file_path), routines=INCLUDE_ROUTINES, **read_kwargs):
+        base = _NEW_PREFIX_RE.sub('', name)
+        if indent == 0:
+            if status_char in PROJECT_STATUSES:
+                scope_key, scope_name, scope_status = base.lower(), base, status_char
+                continue
+            scope_key = scope_name = scope_status = None
+        # Re-bracket: parse_note yields the bare char, but tdiff stores statuses as
+        # '[x]' and every consumer downstream indexes [1] for the char. Yielding the
+        # bare form here fails silently rather than loudly.
+        yield scope_key, scope_name, scope_status, base, f'[{status_char}]', day_index
 
 def daily_path(d):
     return f'{DAILY_FOLDER}/{d}' if DAILY_FOLDER else d
@@ -395,7 +557,7 @@ def cluster_records(records):
 
 def materialize(clusters):
     """Reduce each cluster to one (canonical_base, winning_status) pair."""
-    tasks, order, occurrences = {}, [], {}
+    tasks, order = {}, []
     for members in clusters:
         # Canonical: most recent day; tie-break by longest base.
         canonical = max(members, key=lambda r: (r[2], len(r[0])))[0]
@@ -403,8 +565,7 @@ def materialize(clusters):
         winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
         order.append(canonical)
         tasks[canonical] = winning
-        occurrences[canonical] = [s for _, s, _ in members]
-    return tasks, order, occurrences
+    return tasks, order
 
 def week_span(d):
     """Return (sunday, saturday, label) for the US-format Sun-Sat week containing d."""
@@ -424,106 +585,68 @@ def week_span(d):
     week_num = ((sun - jan1).days + days_back) // 7 + 1
     return sun, sat, f"{sat.year}-W{week_num:02d}"
 
-def week_entries(sunday, exclude=None, exclude_weekly_file=False):
-    """(vault_path, day_index) pairs for a Sun-Sat week: the 7 daily notes plus the
-    YYYY-W## planning file at day_index 0 (lowest dedup priority).
-    `exclude` (ISO date string): skip that day. `exclude_weekly_file`: omit the weekly file."""
+def week_entries(sunday, anchor=None, want_dailies=True, want_weekly=True):
+    """(vault_path, day_index, read_kwargs) triples for one Sun-Sat week.
+
+    The week has exactly two sources and `want_dailies` / `want_weekly` pick which to
+    read: the seven daily notes, and the YYYY-W## weekly note at day_index 0 — lowest
+    dedup priority, so it loses every tie against a daily.
+
+    `anchor` (ISO date) is the day the week was derived from, and bounds it *strictly
+    before* that day — on both sources: the dailies stop at anchor-1, and the weekly
+    note's Actio whitelist stops one marker short. Two things fall out of the one
+    bound. The anchor is the other side of the comparison, so it can never be compared
+    against itself; and nothing dated after it can be outstanding as of it, which is
+    what makes `tdiff wednesday` read "going into Wednesday" rather than "that week,
+    Thursday and Friday included". A bare `today` looked right under the old
+    anchor-only exclusion purely because tomorrow's note is usually empty.
+    """
     entries = []
-    for i in range(7):
-        d = (sunday + timedelta(days=i)).isoformat()
-        if d == exclude:
-            continue
-        entries.append((daily_path(d), i))
-    if not exclude_weekly_file:
+    if want_dailies:
+        for i in range(7):
+            d = (sunday + timedelta(days=i)).isoformat()
+            if anchor is not None and d >= anchor:
+                break
+            entries.append((daily_path(d), i, WEEK_DAY_MODE))
+    if want_weekly:
         _, _, week_label = week_span(sunday)
-        entries.append((weekly_path(week_label), 0))
+        entries.append((weekly_path(week_label), 0, weekly_mode(anchor)))
     return entries
 
 def side_entries(side):
-    """(vault_path, day_index) pairs backing one vault side of a comparison.
-    side: ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
-    Not defined for ('extern', cmd), which reads nothing from the vault."""
+    """(vault_path, day_index, read_kwargs) triples backing one side of a comparison.
+    side: ('day', date_str) | ('week', (sun, anchor, want_dailies, want_weekly))"""
     kind, key = side
     if kind == 'week':
-        sun, exclude_day, exclude_wf = key
-        return week_entries(sun, exclude_day, exclude_wf)
-    if kind == 'weekly_file':
-        return [(weekly_path(key), 0)]
-    return [(daily_path(key), 0)]
+        return week_entries(*key)
+    return [(daily_path(key), 0, DAY_MODE)]
 
-def side_records(side):
-    """Raw (base, status, day_index) records for one side, without materializing."""
-    if side[0] == 'extern':
-        return extern_records(side[1])
-    entries = side_entries(side)
-    prefetch([p for p, _ in entries])
-    return [rec for path, day_index in entries for rec in _parse_obsidian(path, day_index)]
+def side_paths(side):
+    """Just the vault paths one side reads, in order."""
+    return [path for path, _, _ in side_entries(side)]
 
 def fetch_side(side):
-    """Group one side's notes into a single virtual note: (tasks, order, occurrences)."""
-    return materialize(cluster_records(side_records(side)))
+    """Group one side's notes into a single virtual note, scoped by project.
 
-# ── External task sets (-E) ───────────────────────────────────────────────────
-#
-# A side can come from a command instead of the vault, which is what makes
-# plan-vs-actual reachable: `tdiff -E 'tcat today -P' 'tcat today -I'`. tdiff has no
-# idea how to read a weekly note's Actio allocation, and shouldn't — tcat already
-# does, and this is the seam where its answer becomes one side of a diff.
-
-_EXTERN_LINE_RE = re.compile(r'^\s*(?:- )?(\[.\]) (.+)$')
-
-def _extern_clean(name):
-    """Normalize an external task name the same way a vault line is normalized, so
-    both sides of a diff are compared on equal terms."""
-    name = name.replace('\\[', '[').replace('\\]', ']')
-    return _NEW_PREFIX_RE.sub('', strip_section_suffix(normalize_wikilinks(name)))
-
-def _extern_tasks(payload):
-    """Yield (status_char, name) from a parsed JSON payload — either tcat's envelope
-    {"tasks": [...]} or a bare list of {"status", "name"}. Project children are
-    flattened to top level; the project headers themselves carry a project status and
-    are dropped downstream like any other."""
-    tasks = payload.get('tasks', []) if isinstance(payload, dict) else payload
-    for t in tasks:
-        yield t.get('status', ' '), t.get('name', '')
-        for kid in (t.get('children') or []):
-            yield kid.get('status', ' '), kid.get('name', '')
-
-def extern_records(cmd):
-    """Run `cmd` and turn its task list into (base, status, day_index) records.
-
-    `--json` is appended when the command doesn't already ask for it, so the common
-    case reads as the command you'd type by hand. Output is parsed as JSON, falling
-    back to `- [c] name` / `  [c] name` lines when it isn't — which makes any task
-    emitter usable here, not just tcat.
+    Returns {scope_key: (display_name, header_status, tasks, order)}, scope keys in
+    first-seen order. Dedup runs once per scope and the scopes never merge, exactly as
+    in tcat: a task written both bare and under a project keeps a row in each, because
+    the header is real context and a bare occurrence should not swallow a project's
+    copy. The consequence to expect is that scoping only ever *adds* rows.
     """
-    if '--json' not in cmd:
-        cmd = f'{cmd} --json'
-    try:
-        # stdin=DEVNULL for the same reason the obsidian reader uses it: a child that
-        # drains stdin would silently eat whatever is piped into the calling script.
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL)
-    except OSError as e:
-        die(f'could not run {cmd!r}: {e}')
-    if r.returncode != 0:
-        detail = (r.stderr or r.stdout).strip().splitlines()
-        die(f'{cmd!r} exited {r.returncode}' + (f': {detail[0]}' if detail else ''))
-
-    try:
-        pairs = list(_extern_tasks(json.loads(r.stdout)))
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        pairs = [(m.group(1)[1], m.group(2))
-                 for line in r.stdout.splitlines()
-                 if (m := _EXTERN_LINE_RE.match(line.rstrip()))]
-
-    # day_index 0 for everything. An external list has already been deduplicated by
-    # whatever produced it, and tcat's ordering is alphabetical rather than
-    # chronological, so position carries no date meaning to tie-break on — let
-    # STATUS_PRIORITY alone decide. Statuses are stored bracketed ('[x]', not 'x')
-    # because that is what every consumer downstream indexes into.
-    return [(_extern_clean(name), f'[{status}]', 0)
-            for status, name in pairs if name]
+    entries = side_entries(side)
+    prefetch([path for path, _, _ in entries])
+    buckets, headers, order = {}, {}, []
+    for path, day_index, kwargs in entries:
+        for skey, sname, sstatus, base, status, di in _parse_obsidian(
+                path, day_index, kwargs):
+            if skey not in buckets:
+                buckets[skey], headers[skey] = [], (sname, sstatus)
+                order.append(skey)
+            buckets[skey].append((base, status, di))
+    scopes = {k: headers[k] + materialize(cluster_records(v))
+              for k, v in buckets.items()}
+    return scopes, order
 
 def _tokenset(s):
     return set(s.lower().split())
@@ -575,45 +698,44 @@ def best_match(name, candidates):
 
 parser = argparse.ArgumentParser(
     prog='tdiff',
-    description='Compare tasks between two Obsidian daily notes.',
+    description='Compare tasks between two Obsidian notes, or between two weeks.',
     epilog=(
         'Dates accept YYYY-MM-DD, "today", "yesterday", "tomorrow", "0" (today), -N / +N '
         '(e.g. -1 for yesterday), a weekday name (monday..sunday, or mon..sun), which '
         'resolves to its most recent occurrence at or before today, or w## / w2026-W## '
-        'for a weekly planning file (e.g. w20 = week 20 of the current year). '
-        'Use -o N to compare the anchor with anchor + N days; N may be negative.'
+        'for a Sun-Sat week (e.g. w20 = week 20 of the current year). '
+        'A date names its daily note; a w## names a week. A week has two sources — its '
+        'seven dailies and its YYYY-W## weekly note — and -D / -W read just one of them; '
+        'naming neither reads both. Given one positional, it is compared against the week '
+        'around it, minus itself: a date against the days before it, a w## against its '
+        "own dailies."
     ),
 )
-parser.add_argument('date_a', help='first (older) date')
-parser.add_argument('date_b', nargs='?', default=None, help='second (newer) date (omit with --dupes)')
+parser.add_argument('date_a', help='first (older) date or week')
+parser.add_argument('date_b', nargs='?', default=None,
+                    help='second (newer) date or week; omit to compare date_a against '
+                         'the week around it')
 parser.add_argument('-T', '--types',      type=str, default=None,
                     help="show only rows of the given types (chars from 'dacs': "
                          "d=deleted, a=added, c=changed, s=same, e.g. 'dac'); "
                          "prefix '^' to invert (e.g. '^s'). Default: show all types, "
                          "with same-status rows grouped at the bottom.")
-parser.add_argument('-D', '--dupes',      action='store_true', help='find duplicate tasks in a single date')
 parser.add_argument('-I', '--ignore',     action='store_true',
                     help='hide settled tasks — the statuses named by [roles] settled '
                          '(done, cancelled, overrun, postponed, advanced) — on the A side '
                          '(deleted/unchanged rows); added and changed rows are always shown. '
                          'Composes with -S, which wins for any status it names outright')
-parser.add_argument('-o', '--offset',     type=str, default=None,
-                    help='compare anchor (date_a) with date_a + N days; N may be negative')
 parser.add_argument('-S', '--status',     type=str, default=None,
                     help="show only rows whose effective status is in the given set "
                          "(concatenated chars, e.g. 'x-#'); prefix '^' to invert (e.g. '^x'). "
                          "Bare '-S -' looks like a flag to argparse; use -S=- or quote in a set ('x-')")
-parser.add_argument('-w', '--week-offset', type=str, default=None,
-                    help='compare anchor (date_a) with the Sun-Sat week N weeks away; N is any integer (negative, 0, or positive)')
-parser.add_argument('-W', '--no-weekly',  action='store_true',
-                    help='exclude the YYYY-W## weekly planning file from -w/-F aggregation')
-parser.add_argument('-F', '--full-week',  action='store_true',
-                    help='expand day/weekly-file arguments to their full Sun-Sat week aggregation before comparing')
-parser.add_argument('-E', '--exec',       action='store_true', dest='exec_mode',
-                    help='read both positionals as shell commands emitting tasks, rather '
-                         "than as dates (e.g. tdiff -E 'tcat today -P' 'tcat today -I' to "
-                         'compare the day\'s plan against what is still open). --json is '
-                         'appended to each command unless it already asks for it')
+# -D and -W narrow a week to one of its two sources; omitting both reads the whole
+# week, which is why naming both would be a second spelling of the default.
+_week_flags = parser.add_mutually_exclusive_group()
+_week_flags.add_argument('-D', '--dailies', action='store_true',
+                    help="read only the week's seven daily notes, not its weekly note")
+_week_flags.add_argument('-W', '--weekly', action='store_true',
+                    help="read only the week's YYYY-W## weekly note, not its dailies")
 parser.add_argument('--routines',         action='store_true', help='include #routine tasks')
 parser.add_argument('--json',             action='store_true',
                     help='emit a machine-readable JSON document instead of text '
@@ -699,38 +821,10 @@ def _week_label_to_sunday(week_label):
     days_back = 0 if jan1.isoweekday() == 7 else jan1.isoweekday()
     return jan1 - timedelta(days=days_back) + timedelta(weeks=week_num - 1)
 
-def to_full_week_side(side, exclude_weekly_file=False):
-    """Expand a day/weekly_file side into its containing Sun-Sat full-week aggregate.
-    Unlike -w 0 mode, no anchor-exclusion is applied — both sides are independent weeks."""
-    kind, key = side
-    if kind == 'weekly_file':
-        sun = _week_label_to_sunday(key)
-    elif kind == 'day':
-        sun, _, _ = week_span(key)
-    else:
-        return side
-    return ('week', (sun, None, exclude_weekly_file))
-
-offset = None
-if args.offset is not None:
-    try:
-        offset = int(restore(args.offset))
-    except ValueError:
-        parser.error(f"--offset expects an integer, got {args.offset!r}")
-
-week_offset = None
-if args.week_offset is not None:
-    try:
-        week_offset = int(restore(args.week_offset))
-    except ValueError:
-        parser.error(f"--week-offset expects an integer, got {args.week_offset!r}")
-
-if args.full_week and offset is not None:
-    parser.error("--full-week cannot be combined with --offset")
-if args.full_week and week_offset is not None:
-    parser.error("--full-week cannot be combined with --week-offset")
-if args.no_weekly and args.week_offset is None and not args.full_week:
-    parser.error("--no-weekly only applies to -w/--week-offset or -F/--full-week aggregation")
+# A week has two sources; -D and -W pick one, naming neither picks both. argparse
+# makes them mutually exclusive, so this pair is the whole of what the flags mean.
+WANT_DAILIES = not args.weekly
+WANT_WEEKLY  = not args.dailies
 
 raw_a = restore(args.date_a)
 raw_b = restore(args.date_b) if args.date_b is not None else None
@@ -738,104 +832,53 @@ week_label_a = resolve_week_label(raw_a)
 week_label_b = resolve_week_label(raw_b) if raw_b is not None else None
 
 # side_a / side_b:
-#   ('day', date_str) | ('week', (sun, excl_day, excl_wf)) | ('weekly_file', label)
-#   ('extern', command_string)
+#   ('day', date_str) | ('week', (sunday, anchor, want_dailies, want_weekly))
 side_a = side_b = None
 
-if args.exec_mode:
-    # -E is all-or-nothing: both positionals are commands, or neither is. Mixing a
-    # date with a command is deliberately unsupported — write the date into the
-    # command instead (`tdiff -E 'tcat 2026-07-20' 'tcat today'`), which keeps one
-    # rule for reading a positional rather than two that have to be told apart.
-    for flag, val in (('--offset', args.offset), ('--week-offset', args.week_offset)):
-        if val is not None:
-            parser.error(f"cannot combine --exec with {flag}; put the date arithmetic "
-                         f"in the commands themselves")
-    if args.full_week:
-        parser.error("cannot combine --exec with --full-week; ask the command for a "
-                     "week instead (e.g. 'tcat w30 -A')")
-    if args.no_weekly:
-        parser.error("--no-weekly only applies to -w/--week-offset or -F/--full-week aggregation")
-    if args.dupes:
-        if raw_b is not None:
-            parser.error("--dupes takes one command, not two")
-        side_a = ('extern', raw_a)
-    else:
-        if raw_b is None:
-            parser.error("--exec needs two commands (or one with --dupes)")
-        side_a = ('extern', raw_a)
-        side_b = ('extern', raw_b)
-elif offset is not None:
-    if week_label_a:
-        parser.error("--offset mode does not support week specifiers (w##)")
-    if args.date_b is not None:
-        parser.error("cannot combine --offset with an explicit date_b")
-    if args.dupes:
-        parser.error("cannot combine --offset with --dupes")
-    if week_offset is not None:
-        parser.error("cannot combine --offset with --week-offset")
-    if offset == 0:
-        parser.error("--offset must be non-zero")
-    date_a = resolve_date(raw_a)
-    other = (date.fromisoformat(date_a) + timedelta(days=offset)).isoformat()
-    # Keep chronological order: anchor first when offset>0, anchor second when <0.
-    if offset > 0:
-        date_b = other
-    else:
-        date_b = date_a
-        date_a = other
-    side_a = ('day', date_a)
-    side_b = ('day', date_b)
-elif week_offset is not None:
-    if args.date_b is not None:
-        parser.error("cannot combine --week-offset with an explicit date_b")
-    if args.dupes:
-        parser.error("cannot combine --week-offset with --dupes")
-    # anchor may be a day or a weekly file; both give an anchor day for offset math
-    if week_label_a:
-        anchor_sun = _week_label_to_sunday(week_label_a)
-        anchor_day_str = anchor_sun.isoformat()
-        anchor_side = ('weekly_file', week_label_a)
-    else:
-        date_a = resolve_date(raw_a)
-        anchor_day_str = date_a
-        anchor_side = ('day', date_a)
-    target_day = date.fromisoformat(anchor_day_str) + timedelta(days=week_offset * 7)
-    sun, _, _ = week_span(target_day)
-    # When week_offset == 0 the anchor is inside the target week; exclude it from
-    # the aggregation so the diff is "anchor vs the rest of its week".
-    if week_offset == 0:
-        if week_label_a:
-            # weekly file is the anchor — exclude it from the agg side, keep all daily notes
-            week_key = (sun, None, True)
-        else:
-            # day is the anchor — exclude that day from the agg side
-            week_key = (sun, anchor_day_str, args.no_weekly)
-    else:
-        week_key = (sun, None, args.no_weekly)
-    # week_offset <= 0 -> week is older-or-same -> week on left, anchor on right.
-    # week_offset >  0 -> anchor on left, week on right.
-    if week_offset <= 0:
-        side_a = ('week', week_key)
-        side_b = anchor_side
-    else:
-        side_a = anchor_side
-        side_b = ('week', week_key)
-elif args.date_b is not None:
-    side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
-    side_b = ('weekly_file', week_label_b) if week_label_b else ('day', resolve_date(raw_b))
-    if args.full_week:
-        side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
-        side_b = to_full_week_side(side_b, exclude_weekly_file=args.no_weekly)
-        if side_a[1][0] == side_b[1][0]:
-            parser.error("both dates fall in the same Sun-Sat week; --full-week comparison would be a no-op")
-elif not args.dupes:
-    parser.error("date_b is required (or use --dupes, --offset N, or --week-offset N)")
+def base_side(raw, week_label):
+    """What a positional names on its own: a w## names its whole Sun-Sat week, read
+    through whichever sources -D/-W left standing; anything else names a daily note.
+
+    A date is never promoted to its week. -D/-W narrow a week that is already there,
+    which is why `tdiff mon fri -D` is an error rather than a second way to spell
+    `tdiff w33 w34 -D`."""
+    if week_label:
+        sun = _week_label_to_sunday(week_label)
+        return ('week', (sun, None, WANT_DAILIES, WANT_WEEKLY))
+    return ('day', resolve_date(raw))
+
+if raw_b is not None:
+    side_a = base_side(raw_a, week_label_a)
+    side_b = base_side(raw_b, week_label_b)
+    if side_a[0] == 'week' and side_b[0] == 'week' and side_a[1][0] == side_b[1][0]:
+        parser.error("both positionals name the same Sun-Sat week; "
+                     "comparing it against itself would be a no-op")
+elif week_label_a:
+    # One w##: its weekly note against its own dailies. The note is the anchor, so it
+    # drops out of the week built around it — which leaves exactly the two sources,
+    # one per side. The weekly note is what was written first, so it takes the A side.
+    #
+    # Both flags are rejected here rather than ignored: -D would remove the A side and
+    # -W the B side, and either way the command already has a shorter spelling.
+    if args.dailies or args.weekly:
+        parser.error("a lone w## already compares the weekly note against that week's "
+                     "dailies; -D/-W would leave one side empty")
+    sun = _week_label_to_sunday(week_label_a)
+    side_a = ('week', (sun, None, False, True))
+    side_b = ('week', (sun, None, True, False))
 else:
-    # dupes mode — anchor may be a day or a weekly file
-    side_a = ('weekly_file', week_label_a) if week_label_a else ('day', resolve_date(raw_a))
-    if args.full_week:
-        side_a = to_full_week_side(side_a, exclude_weekly_file=args.no_weekly)
+    # One date: the week around it against the date itself. The date is the anchor and
+    # drops back out of that week, so it is never compared against itself.
+    anchor = resolve_date(raw_a)
+    sun, _, _ = week_span(anchor)
+    side_a = ('week', (sun, anchor, WANT_DAILIES, WANT_WEEKLY))
+    side_b = ('day', anchor)
+
+# -D/-W narrow a week. With two dates there is no week to narrow, and promoting them
+# both would silently answer a different question than the one that was asked.
+if (args.dailies or args.weekly) and 'week' not in (side_a[0], side_b[0]):
+    parser.error("-D/-W need a week to narrow; name one with w## "
+                 "(e.g. 'tdiff w33 w34 -D') or give a single date")
 
 status_filter = None            # (set_of_chars, negate)
 if args.status is not None:
@@ -872,8 +915,7 @@ def suppressed(eff, typ):
 
     -I is restricted to types 0 and 3 — deleted and same — because those are the rows
     whose displayed status comes from the settled A side. Added and changed rows are
-    never hidden by it. Dupes mode passes typ=0: there is only one side, and it is
-    the A side.
+    never hidden by it.
     """
     if status_filter is not None:
         chars, negate = status_filter
@@ -938,169 +980,135 @@ def side_label(side):
     return week_span(key[0])[2] if kind == 'week' else key
 
 def side_json(side):
-    """Describe one side of the comparison, including the vault files it read —
-    which is what actually records -W/-w 0 exclusions."""
+    """Describe one side of the comparison, including the vault files it read — which
+    is where -D/-W's narrowing and the one-positional form's exclusion are observable,
+    since neither shows up anywhere else in the output."""
     kind, key = side
     out = {'kind': kind, 'label': side_label(side)}
-    if kind == 'extern':
-        # No `files`: nothing in the vault was read, and the command is the whole
-        # provenance. Naming it is what makes an -E run reproducible from its output.
-        out['command'] = key
-        return out
     if kind == 'week':
         sun, sat, _ = week_span(key[0])
         out['start'], out['end'] = sun.isoformat(), sat.isoformat()
-    out['files'] = [p for p, _ in side_entries(side)]
+    out['files'] = side_paths(side)
     return out
 
 def emit_json(doc):
     json.dump(doc, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write('\n')
 
-# ── Dupes mode ───────────────────────────────────────────────────────────────
-
-if args.dupes:
-    _label = side_label(side_a)
-    clusters = cluster_records(side_records(side_a))
-
-    dupes = []
-    for members in clusters:
-        if len(members) <= 1:
-            continue
-        winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
-        if winning[1] in PROJECT_STATUSES:
-            continue
-        if suppressed(winning[1], 0):
-            continue
-        if not status_match(winning[1]):
-            continue
-        # Group records by base within the cluster: one variant per distinct wording.
-        by_base = {}
-        for base, status, _ in members:
-            by_base.setdefault(base, []).append(status)
-        dupes.append({
-            'status': winning[1],
-            # exact: the same wording repeated ("!!"); otherwise variant wordings ("~~")
-            'exact': len(by_base) == 1,
-            'count': len(members),
-            'variants': [
-                {'name': base, 'count': len(sts), 'statuses': [s[1] for s in sts]}
-                for base, sts in by_base.items()
-            ],
-        })
-
-    if args.json:
-        emit_json({'mode': 'dupes', 'a': side_json(side_a), 'duplicates': dupes})
-        finish()
-
-    for i, dupe in enumerate(dupes):
-        if i == 0:
-            print(f"{YELLOW}Duplicates:{RESET}")
-        else:
-            print()
-        marker = RED if dupe['exact'] else YELLOW
-        sigil = '!!' if dupe['exact'] else '~~'
-        for variant in dupe['variants']:
-            statuses = ', '.join(f"[{s}]" for s in variant['statuses'])
-            print(f"  {marker}{sigil} {variant['name']}{RESET}  ({variant['count']}×  {statuses})")
-
-    if not dupes:
-        print(f"{DIM}No duplicates found in {_label}.{RESET}")
-
-    finish()
-
 # ── Diff ──────────────────────────────────────────────────────────────────────
 
-# One batched read for both sides, so every vault call overlaps. External sides read
-# nothing from the vault, so they contribute no paths.
-prefetch([p for side in (side_a, side_b) if side[0] != 'extern'
-          for p, _ in side_entries(side)])
+# One batched read for both sides, so every vault call overlaps.
+prefetch([p for side in (side_a, side_b) for p in side_paths(side)])
 
-a_tasks, a_order, _ = fetch_side(side_a)
-b_tasks, b_order, _ = fetch_side(side_b)
-
-a_names = set(a_tasks)
-b_names = set(b_tasks)
+a_scopes, a_order = fetch_side(side_a)
+b_scopes, b_order = fetch_side(side_b)
 
 # Types: 0=deleted, 1=added, 2=changed, 3=same
-# Rows are (sort_key, type, row_dict); row_dict is both the JSON record and what
+# Rows are (scope_key, name, type, row_dict); row_dict is both the JSON record and what
 # render() turns into a text line, so the two output modes can't drift apart.
 #   name        canonical task name (A's for deleted/changed, B's for added)
 #   status      effective status char — B's for added/changed/same, A's for deleted
 #   old_status  A's status char (changed rows only)
 #   new_name    B's name (changed rows only, and only when the fuzzy match renamed it)
+#   project     the project the row sits under; absent on a bare row
 TYPE_NAMES = {0: 'deleted', 1: 'added', 2: 'changed', 3: 'same'}
 
-def row(typ, name, status, old_status=None, new_name=None):
+# scope_key -> (display_name, header_status) for every project either side saw. B wins
+# a clash, matching the effective-status rule rows follow: B is the later statement.
+PROJECTS = {k: v[:2] for k, v in a_scopes.items() if k is not None}
+PROJECTS.update({k: v[:2] for k, v in b_scopes.items() if k is not None})
+
+def row(scope, typ, name, status, old_status=None, new_name=None):
     r = {'type': TYPE_NAMES[typ], 'name': name, 'status': status}
     if old_status is not None:
         r['old_status'] = old_status
     if new_name is not None:
         r['new_name'] = new_name
-    return (name, typ, r)
+    if scope is not None:
+        r['project'] = PROJECTS[scope][0]
+    return (scope, name, typ, r)
 
-def render(r):
+def render(r, indent=''):
     st = f"[{r['status']}]"
     typ = r['type']
     if typ == 'same':
-        return f"{DIM}== {st}  {r['name']}{RESET}"
+        return f"{DIM}{indent}== {st}  {r['name']}{RESET}"
     if typ == 'deleted':
-        return f"{RED}-- {st}  {r['name']}{RESET}"
+        return f"{RED}{indent}-- {st}  {r['name']}{RESET}"
     if typ == 'added':
-        return f"{GREEN}++ {st}  {r['name']}{RESET}"
+        return f"{GREEN}{indent}++ {st}  {r['name']}{RESET}"
     old = f"[{r['old_status']}]"
     if 'new_name' in r:
-        return f"{YELLOW}~~ {old} {r['name']} → {st} {r['new_name']}{RESET}"
-    return f"{YELLOW}~~ {old} → {st}  {r['name']}{RESET}"
+        return f"{YELLOW}{indent}~~ {old} {r['name']} → {st} {r['new_name']}{RESET}"
+    return f"{YELLOW}{indent}~~ {old} → {st}  {r['name']}{RESET}"
+
+def diff_scope(scope, a_tasks, a_order, b_tasks, b_order):
+    """Diff one project's tasks against the other side's copy of that project.
+
+    Scopes are diffed independently and fuzzy matching never crosses one, so a task
+    that moved between projects reads as deleted there and added here rather than
+    silently staying put. A scope only one side has yields all-deleted or all-added,
+    which is how a project appearing or disappearing shows up at all.
+    """
+    rows = []
+    a_names, b_names = set(a_tasks), set(b_tasks)
+    used_a, used_b = set(), set()
+
+    # Pass 1: exact name matches
+    for name in a_names & b_names:
+        used_a.add(name)
+        used_b.add(name)
+        if a_tasks[name] != b_tasks[name]:
+            rows.append(row(scope, 2, name, b_tasks[name][1],
+                            old_status=a_tasks[name][1]))
+        else:
+            rows.append(row(scope, 3, name, a_tasks[name][1]))
+
+    # Pass 2: fuzzy match remaining
+    remaining_a = [n for n in a_order if n not in used_a]
+    remaining_b = [n for n in b_order if n not in used_b]
+    # Candidates carry their token sets so pass 2 tokenizes each name once, not once
+    # per comparison; matched entries are dropped instead of re-filtered every round.
+    candidates = [(n, _tokenset(n)) for n in remaining_b]
+
+    for a_name in remaining_a:
+        match = best_match(a_name, candidates)
+        if match:
+            used_b.add(match)
+            candidates = [pair for pair in candidates if pair[0] != match]
+            rows.append(row(scope, 2, a_name, b_tasks[match][1],
+                            old_status=a_tasks[a_name][1],
+                            new_name=match if match != a_name else None))
+        else:
+            rows.append(row(scope, 0, a_name, a_tasks[a_name][1]))
+
+    for b_name in remaining_b:
+        if b_name not in used_b:
+            rows.append(row(scope, 1, b_name, b_tasks[b_name][1]))
+    return rows
 
 output = []
+for scope in a_order + [k for k in b_order if k not in a_scopes]:
+    _, _, a_tasks, a_names_order = a_scopes.get(scope, (None, None, {}, []))
+    _, _, b_tasks, b_names_order = b_scopes.get(scope, (None, None, {}, []))
+    output += diff_scope(scope, a_tasks, a_names_order, b_tasks, b_names_order)
 
-used_b = set()
-used_a = set()
-
-# Pass 1: exact name matches
-for name in a_names & b_names:
-    used_a.add(name)
-    used_b.add(name)
-    if a_tasks[name] != b_tasks[name]:
-        output.append(row(2, name, b_tasks[name][1], old_status=a_tasks[name][1]))
-    else:
-        output.append(row(3, name, a_tasks[name][1]))
-
-# Pass 2: fuzzy match remaining
-remaining_a = [n for n in a_order if n not in used_a]
-remaining_b = [n for n in b_order if n not in used_b]
-# Candidates carry their token sets so pass 2 tokenizes each name once, not once
-# per comparison; matched entries are dropped instead of re-filtered every round.
-candidates = [(n, _tokenset(n)) for n in remaining_b]
-
-for a_name in remaining_a:
-    match = best_match(a_name, candidates)
-    if match:
-        used_a.add(a_name)
-        used_b.add(match)
-        candidates = [pair for pair in candidates if pair[0] != match]
-        output.append(row(2, a_name, b_tasks[match][1],
-                          old_status=a_tasks[a_name][1],
-                          new_name=match if match != a_name else None))
-    else:
-        output.append(row(0, a_name, a_tasks[a_name][1]))
-
-for b_name in remaining_b:
-    if b_name not in used_b:
-        output.append(row(1, b_name, b_tasks[b_name][1]))
-
-output.sort(key=lambda x: (x[1] == 3, x[0].lower()))
+# Projects first, alphabetically, then the bare rows — so the rows that carry their own
+# context lead, and the familiar flat list follows. `same` still sorts last within each.
+output.sort(key=lambda x: (x[0] is None, PROJECTS[x[0]][0].lower() if x[0] else '',
+                           x[2] == 3, x[1].lower()))
 
 # ── Filter ────────────────────────────────────────────────────────────────────
 
 counts = {0: 0, 1: 0, 2: 0, 3: 0}
 kept = []
 seen_statuses = set()
-for _, typ, r in output:
+for scope, _, typ, r in output:
     eff = r['status']
     seen_statuses.add(eff)
-    if eff in PROJECT_STATUSES:          # structural: always excluded, any row
+    # Structural: a project status on an ordinary row is a nested header, not work.
+    # A project's own header never reaches here — it is a scope, not a row.
+    if eff in PROJECT_STATUSES:
         continue
     if suppressed(eff, typ):           # [roles] hide, and -I on the settled A side
         continue
@@ -1109,7 +1117,7 @@ for _, typ, r in output:
     if not type_match(typ):            # -T: show only matching row types
         continue
     counts[typ] += 1
-    kept.append(r)
+    kept.append((scope, r))
 
 report_unlisted(seen_statuses)
 
@@ -1120,7 +1128,11 @@ if args.json:
         'mode': 'diff',
         'a': side_json(side_a),
         'b': side_json(side_b),
-        'rows': kept,
+        # Flat, with the project named on each row rather than nested children: the
+        # filters and the summary then need no shape of their own, and grouping stays
+        # a rendering concern. tcat's nested envelope had one consumer, -E, which is
+        # gone.
+        'rows': [r for _, r in kept],
         'summary': {
             'added':   counts[1],
             'deleted': counts[0],
@@ -1131,8 +1143,16 @@ if args.json:
     })
     finish()
 
-for r in kept:
-    print(render(r))
+# A header prints only when a row under it survived the filters — the sort has already
+# put every project's rows together, so tracking the last one seen is enough.
+last_scope = ...
+for scope, r in kept:
+    if scope != last_scope:
+        if scope is not None:
+            name, status = PROJECTS[scope]
+            print(f"{DIM}[{status}] {name}{RESET}")
+        last_scope = scope
+    print(render(r, indent='   ' if scope is not None else ''))
 
 if not args.no_summary:
     total = sum(counts.values())
@@ -1143,6 +1163,9 @@ if not args.no_summary:
         f"{DIM}{counts[3]} same{RESET}",
         f"{total} total",
     ]
+    projects = len({s for s, _ in kept if s is not None})
+    if projects:
+        parts.insert(-1, f"{projects} project" + ('' if projects == 1 else 's'))
     print('  ' + f"  {DIM}·{RESET}  ".join(parts))
 
 finish()

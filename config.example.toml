@@ -21,7 +21,7 @@
 [vault]
 # Optional. If set (non-empty), daily/weekly lookups are prefixed with this folder.
 # If empty or omitted, files resolve by name anywhere in the vault — which is how
-# `obsidian tasks file=` behaves natively, so leaving these empty is usually right.
+# `obsidian read file=` behaves natively, so leaving these empty is usually right.
 daily_folder = ""
 weekly_folder = ""
 
