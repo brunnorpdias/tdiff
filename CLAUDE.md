@@ -42,7 +42,7 @@ scope is closing too eagerly.
 
 ## Architecture
 
-The entire tool lives in a single executable file: `tdiff` (~1170 lines, Python 3).
+The entire tool lives in a single executable file: `tdiff` (~1250 lines, Python 3).
 
 The script processes tasks in this pipeline:
 
@@ -50,7 +50,21 @@ The script processes tasks in this pipeline:
 
    **`read`, not `tasks`.** The flat task list `obsidian tasks` returns has already thrown away the headings, and the ladder markers under `### *Actio*` are the only thing that says which of a weekly note's tasks are the week's plan. `tcat` has always read raw markdown for that reason; moving `tdiff` onto it is what stopped the two tools disagreeing about what a note contains.
 
-2. **Parse** — `parse_note()` turns markdown into `(indent, status_char, name, seq)` tuples; `_parse_obsidian()` adapts those to `(scope_key, scope_name, scope_status, base, status, day_index)` records. `parse_note` is **vendored verbatim into `tcat`** alongside the date core (see **Date formats**); `clean_text` used to be and no longer is (see **Task names** below). `#routine` lines are dropped unless `--routines` is passed. Statuses are stored **bracketed** (`'[x]'`, not `'x'`); `parse_note` yields the bare char, so `_parse_obsidian` re-brackets — every consumer downstream indexes `[1]` for the char, so a record source that forgets this fails silently rather than loudly.
+2. **Parse** — `parse_note()` turns markdown into `(indent, status_char, name, seq)` tuples; `_parse_obsidian()` adapts those to `(scope_key, scope_name, scope_status, base, status, day_index)` records. `parse_note` was **vendored verbatim into `tcat`** alongside the date core (see **Date formats**) and has now diverged there too — see **Fenced blocks** below; `clean_text` diverged earlier (see **Task names** below). `#routine` lines are dropped unless `--routines` is passed. Statuses are stored **bracketed** (`'[x]'`, not `'x'`); `parse_note` yields the bare char, so `_parse_obsidian` re-brackets — every consumer downstream indexes `[1]` for the char, so a record source that forgets this fails silently rather than loudly.
+
+   **Fenced blocks are skipped.** ` ``` ` / `~~~` toggle `in_fence`, and nothing inside
+   is parsed — not tasks, not headings, not ladder markers. Fencing is how the vault
+   freezes a task list: `### *Fixa*` and a daily's `## *Actio Fixa*` are whole fenced
+   snapshots, and a `**future**` bucket is often parked in a ` ```markdown ` block.
+   `parse_note` used to ignore fences outright, which was harmless only while the reader
+   was `obsidian tasks` — that CLI never handed the fenced lines over. Reading raw
+   markdown made them live tasks again: `tdiff 2026-05-17 2026-05-18` reported 89 rows
+   where 19 are real, the other 70 being that day's frozen copy of the week. Weekly-mode
+   reads never showed it, because Actio's region and day whitelist already dropped both
+   Fixa and future — which is why it only surfaced on daily notes.
+
+   Every fence in the vault is balanced and none nests, so a plain toggle is enough; an
+   unbalanced one would swallow the rest of a note, and nothing detects that.
 
    **Project grouping happens here, per note.** A task at indent 0 whose status is in `[roles] project` opens a scope and is not itself yielded; indented tasks join it; any other indent-0 task closes it and joins the bare scope (`scope_key = None`). Doing it inside the per-note loop is not incidental: a week side concatenates eight notes, and a header left open at the end of one would otherwise adopt the next note's children. `tcat`'s `build_groups` never faces that, seeing one note at a time.
 
@@ -214,14 +228,14 @@ is a vault-convention question, not a code one.
    (`[[a/b|c]]` → `[[b|c]]`);
 4. `MDLINK_RE` — reduces `[label](url)` to `label`.
 
-**This diverges from `tcat` on two counts, and `check-core-sync.sh` does not catch
-either**, because `clean_text` and `parse_note` are still absent from its `FUNCS` list.
-`tcat` reduces links *first* and strips the suffix last, which truncates any linked title
-containing a dash — 18 of 455 names in this vault, some to a third of their length
-(`read: [startup school – yc](…), [essays – pg](…)` became `read: startup school`). And
-`tcat` reduces a wikilink to its display text where `tdiff` keeps the brackets, which is
-115 of 455 names. `tdiff` is the correct side of both; reconciling `tcat` is a later
-session's job, and until then this paragraph is the only thing recording the drift.
+**This once diverged from `tcat` on two counts; both are reconciled and
+`check-core-sync.sh` now covers `clean_text`.** The history is worth keeping because it
+says which side is canonical. `tcat` reduced links *first* and stripped the suffix last,
+which truncates any linked title containing a dash
+(`read: [startup school – yc](…), [essays – pg](…)` became `read: startup school`) — 18 of
+455 names in this vault, some to a third of their length. And `tcat` reduced a wikilink to
+its display text where `tdiff` keeps the brackets, 115 of 455 names. `tdiff` was the
+correct side of both, which is why `tcat` moved.
 
 ## Obsidian CLI stalls
 
@@ -374,16 +388,21 @@ same thing about `[order]` in its own `report_unlisted()`.
 pinned commit here. Any change to them has to land in both tools together and the pin
 bumped, or the two will disagree about which note to read.
 
-`parse_note` (with `TASK_RE`, `H2_RE`, `H3_RE`, `MARK_RE`, `MDLINK_RE`, `WEEK_DAYS` and
-`LADDER`) joined that set when the reader was unified — it came *from* `tcat` and is
-byte-identical to its copy, but `tdiff` is the canonical side, so `check-core-sync.sh`
-still needs it added to its `FUNCS` list and its `PIN` bumped. **Until that happens the
-script does not cover it.**
+`parse_note` (with `TASK_RE`, `H2_RE`, `H3_RE`, `MARK_RE`, `FENCE_RE`, `MDLINK_RE`,
+`WEEK_DAYS` and `LADDER`) joined that set when the reader was unified — it came *from*
+`tcat`, but `tdiff` is the canonical side. `check-core-sync.sh` now lists both it and
+`clean_text` in `FUNCS`, and passed at `PIN=92f195c`.
 
-`clean_text` is the same story with a sharper edge: it is **no longer identical**, and
-nothing checks that. See **Task names** above for what diverged and why `tdiff` is the
-correct side. Adding `clean_text` to `FUNCS` before reconciling `tcat` would fail the
-check by design — which is the right order to do it in, since the failure is the point.
+**The fence fix breaks that, deliberately, and reconciling `tcat` is an open task.**
+`tdiff`'s `parse_note` now skips fenced blocks (see **Fenced blocks** above) and `tcat`'s
+copy does not, so once the pin is bumped past this commit the check reports `parse_note`
+DRIFTED. Landing it in `tcat` means the identical body plus `FENCE_RE` added to the
+script's `CONSTS` list. `tcat` was not touched here at the user's request — it had work in
+flight.
+
+`clean_text` was the earlier divergence and is now reconciled — the two copies are
+byte-identical and the script checks them. **Task names** above still records what
+diverged and why `tdiff` was the correct side; the tcat-side warning there is stale.
 
 `resolve_date` sits outside `tcat`'s marked vendor block in both files — it needs
 `parser`, so it has to follow the argument parser — but it is checked all the same. The

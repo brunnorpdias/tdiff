@@ -199,6 +199,7 @@ TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
 H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
 H3_RE   = re.compile(r'^###\s+\*(\w+)\*')
 MARK_RE = re.compile(r'^\*{2,3}([a-z]+)\*{2,3}\s*$')
+FENCE_RE = re.compile(r'^\s*(?:```|~~~)')
 MDLINK_RE = re.compile(r'\[([^\[\]]+)\]\([^()]*\)')
 
 # The weekly day ladder. A whitelist, never a blacklist — the weekly template
@@ -236,9 +237,14 @@ def clean_text(s):
 def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
     """Yield (indent, status_char, name, seq) for tasks in a note.
 
-    Fence-agnostic by design: ``` lines are ignored, never toggled. The weekly
-    note's whole Fixa section is itself fenced, so toggling desynchronises. Every
-    `base`/`dataviewjs` block lives under ## *Recensio*, ahead of ### *Actio*.
+    A fenced block is not content: ``` / ~~~ toggle, and nothing inside is parsed —
+    not tasks, not headings, not ladder markers. Fencing is how the vault freezes a
+    task list: ### *Fixa* and a daily's ## *Actio Fixa* are whole fenced snapshots,
+    and a **future** bucket is often parked in a ```markdown block. Reading those
+    back as live tasks reported a day's frozen copy of the week as work of its own
+    (2026-05-17 alone carried 91 such lines). This parser used to ignore fences
+    outright; that was safe only while the reader was `obsidian tasks`, which never
+    handed the fenced lines over in the first place.
 
     region/day: when both are given, only tasks under that ### heading and that
     ladder marker are yielded (weekly mode). `day` takes one marker name or a
@@ -253,8 +259,14 @@ def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
     """
     days = (day,) if isinstance(day, str) else day
     cur_region = cur_day = None
+    in_fence = False
     seq = 0
     for line in lines:
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if H2_RE.match(line):
             cur_region = cur_day = None
             continue
