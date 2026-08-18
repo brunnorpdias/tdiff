@@ -24,6 +24,7 @@ def strip_section_suffix(s):
 # Populated by load_config() once args are parsed. Placeholder empty values here
 # so nothing explodes if referenced before load_config() runs.
 STATUS_PRIORITY  = {}
+DISPLAY_ORDER    = {}
 SETTLED_STATUSES = set()
 HIDDEN_STATUSES  = set()
 PROJECT_STATUSES = set()
@@ -94,8 +95,8 @@ def load_config(override, error):
     [theme.*] is read by tcat and deliberately ignored here: in tdiff the diff type
     owns the row colour, so a status colour would have nothing to paint.
     """
-    global STATUS_PRIORITY, SETTLED_STATUSES, HIDDEN_STATUSES, PROJECT_STATUSES
-    global DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
+    global STATUS_PRIORITY, DISPLAY_ORDER, SETTLED_STATUSES, HIDDEN_STATUSES
+    global PROJECT_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
 
     merged = {}
     for path in config_paths(override):
@@ -125,6 +126,15 @@ def load_config(override, error):
         notice('no [dedup] priority in config — dedup will pick an arbitrary status '
                'when a task appears more than once')
 
+    # Display rank, and the one place tdiff and tcat now agree on [order]. Rank is
+    # position in the list, so `x` sorts last; see display_rank() for what an unlisted
+    # status does. This is the *opposite* end from [dedup] above and stays a separate
+    # key for that reason: a row that dedup picked `x` for still prints at the bottom.
+    seq = merged.get('order', {}).get('statuses', [])
+    DISPLAY_ORDER = {c: i for i, c in enumerate(seq)}
+    if not DISPLAY_ORDER:
+        notice('no [order] statuses in config — rows will sort by name alone')
+
     roles = merged.get('roles', {})
     PROJECT_STATUSES = set(roles.get('project', []))
     SETTLED_STATUSES = set(roles.get('settled', []))
@@ -135,6 +145,17 @@ def load_config(override, error):
     vault = merged.get('vault', {})
     DAILY_FOLDER  = vault.get('daily_folder', '')
     WEEKLY_FOLDER = vault.get('weekly_folder', '')
+
+UNRANKED = 10 ** 6      # tcat's sentinel, same value, so the two sort alike
+
+def display_rank(ch):
+    """Sort rank for a status char, from [order].statuses.
+
+    A status the table does not list ranks last as a block — alphabetical within it,
+    since the name is the next sort key — which is what the shipped statuses.toml
+    promises and what tcat does with the same list. report_unlisted() names them.
+    """
+    return DISPLAY_ORDER.get(ch, UNRANKED)
 
 def flush_notices():
     for m in NOTICES:
@@ -561,8 +582,11 @@ def materialize(clusters):
     for members in clusters:
         # Canonical: most recent day; tie-break by longest base.
         canonical = max(members, key=lambda r: (r[2], len(r[0])))[0]
-        # Winning status: highest STATUS_PRIORITY; tie-break by latest day.
-        winning = max(members, key=lambda r: (r[2], STATUS_PRIORITY.get(r[1][1], 0)))[1]
+        # Winning status: highest STATUS_PRIORITY; tie-break by latest day. The tuple
+        # ran (day, priority) until now, which quietly made it the other way round —
+        # the last note to mention a task won outright and [dedup] only settled a
+        # same-day tie, so a Friday [/] beat a Tuesday [x].
+        winning = max(members, key=lambda r: (STATUS_PRIORITY.get(r[1][1], 0), r[2]))[1]
         order.append(canonical)
         tasks[canonical] = winning
     return tasks, order
@@ -719,11 +743,11 @@ parser.add_argument('-T', '--types',      type=str, default=None,
                     help="show only rows of the given types (chars from 'dacs': "
                          "d=deleted, a=added, c=changed, s=same, e.g. 'dac'); "
                          "prefix '^' to invert (e.g. '^s'). Default: show all types, "
-                         "with same-status rows grouped at the bottom.")
+                         "ordered by [order].statuses.")
 parser.add_argument('-I', '--ignore',     action='store_true',
-                    help='hide settled tasks — the statuses named by [roles] settled '
-                         '(done, cancelled, overrun, postponed, advanced) — on the A side '
-                         '(deleted/unchanged rows); added and changed rows are always shown. '
+                    help='hide settled tasks — any row whose displayed status is named by '
+                         '[roles] settled (done, cancelled, overrun, postponed, advanced), '
+                         'whichever side it came from. '
                          'Composes with -S, which wins for any status it names outright')
 parser.add_argument('-S', '--status',     type=str, default=None,
                     help="show only rows whose effective status is in the given set "
@@ -900,7 +924,7 @@ def status_match(eff):
 if args.ignore and not SETTLED_STATUSES:
     notice('-I: no [roles] settled in config — nothing to hide')
 
-def suppressed(eff, typ):
+def suppressed(eff):
     """Whether a row is hidden by default, before -S and -T get their say.
 
     Two rules live here, both from the shared [roles] table: `hide` (never shown at
@@ -913,9 +937,12 @@ def suppressed(eff, typ):
     shows done rows rather than nothing. A negated -S only says what to drop, so both
     rules still apply to everything it doesn't name.
 
-    -I is restricted to types 0 and 3 — deleted and same — because those are the rows
-    whose displayed status comes from the settled A side. Added and changed rows are
-    never hidden by it.
+    -I asks about the row's *displayed* status and nothing else, so it hides settled
+    work whichever side put it there — a task finished on B is as settled as one
+    finished on A. It used to be restricted to types 0 and 3, on the theory that only
+    those read their status off the A side; that left `++ [x]` and `~~ [/] → [x]`
+    on screen, which is exactly the work -I exists to get rid of. Filtering on `eff`
+    is also what -S does, so the three status filters now ask the same question.
     """
     if status_filter is not None:
         chars, negate = status_filter
@@ -923,7 +950,7 @@ def suppressed(eff, typ):
             return False
     if eff in HIDDEN_STATUSES:
         return True
-    return args.ignore and typ in (0, 3) and eff in SETTLED_STATUSES
+    return args.ignore and eff in SETTLED_STATUSES
 
 TYPE_CHARS = {'d': 0, 'a': 1, 'c': 2, 's': 3}
 
@@ -944,17 +971,25 @@ def type_match(typ):
     return (typ not in types) if negate else (typ in types)
 
 def report_unlisted(seen):
-    """Name status chars this run met that no [dedup] tier ranks.
+    """Name status chars this run met that the config does not rank.
 
-    They rank 0, which means they lose every dedup tie silently — a status the vault
-    uses but the config forgot is invisible until a task wears it twice.
+    Two tables rank a status and neither is loud about a gap. Missing from [dedup] it
+    ranks 0 and loses every tie silently — invisible until a task wears it twice.
+    Missing from [order] it sorts last, which just looks like a choice. Both are
+    reported, and separately, because a config can easily have one and not the other.
+    tcat says the same thing about [order] in its own report_unlisted().
     """
     # Project statuses are excluded from every output, so they never reach a dedup
     # tie-break and want no rank. Reporting them would be noise on every run.
-    unlisted = sorted(seen - set(STATUS_PRIORITY) - PROJECT_STATUSES)
+    seen = seen - PROJECT_STATUSES
+    unlisted = sorted(seen - set(STATUS_PRIORITY))
     if unlisted and STATUS_PRIORITY:
         chars = ' '.join(f'[{c}]' for c in unlisted)
         notice(f'not in [dedup] priority, ranked 0: {chars}')
+    unranked = sorted(seen - set(DISPLAY_ORDER))
+    if unranked and DISPLAY_ORDER:
+        chars = ' '.join(f'[{c}]' for c in unranked)
+        notice(f'not in [order] statuses, so sorted last: {chars}')
 
 def finish(code=0):
     """Exit, flushing notices first. --json and --no-summary both mean 'output with
@@ -1093,10 +1128,22 @@ for scope in a_order + [k for k in b_order if k not in a_scopes]:
     _, _, b_tasks, b_names_order = b_scopes.get(scope, (None, None, {}, []))
     output += diff_scope(scope, a_tasks, a_names_order, b_tasks, b_names_order)
 
-# Projects first, alphabetically, then the bare rows — so the rows that carry their own
-# context lead, and the familiar flat list follows. `same` still sorts last within each.
-output.sort(key=lambda x: (x[0] is None, PROJECTS[x[0]][0].lower() if x[0] else '',
-                           x[2] == 3, x[1].lower()))
+# Projects first, then the bare rows — so the rows that carry their own context lead and
+# the familiar flat list follows. Projects are ordered by their *header* status and never
+# by their children's: sorting a project by the statuses inside it would let one urgent
+# task drag a whole project to the top.
+#
+# Rows inside a group go type, then status, then name. Type outranks status because the
+# question a diff answers is what moved, not what state it is in — reading straight down
+# the added block and then the deleted block is the point of the tool. Status orders
+# within a type, which is where [order].statuses does its work.
+TYPE_RANK = {1: 0, 0: 1, 2: 2, 3: 3}    # added, deleted, changed, same — the summary's order
+output.sort(key=lambda x: (x[0] is None,
+                           display_rank(PROJECTS[x[0]][1]) if x[0] else 0,
+                           PROJECTS[x[0]][0].lower() if x[0] else '',
+                           TYPE_RANK[x[2]],
+                           display_rank(x[3]['status']),
+                           x[1].lower()))
 
 # ── Filter ────────────────────────────────────────────────────────────────────
 
@@ -1110,7 +1157,7 @@ for scope, _, typ, r in output:
     # A project's own header never reaches here — it is a scope, not a row.
     if eff in PROJECT_STATUSES:
         continue
-    if suppressed(eff, typ):           # [roles] hide, and -I on the settled A side
+    if suppressed(eff):                # [roles] hide, and -I on any settled row
         continue
     if not status_match(eff):          # -S: show only matching effective statuses
         continue
@@ -1150,7 +1197,9 @@ for scope, r in kept:
     if scope != last_scope:
         if scope is not None:
             name, status = PROJECTS[scope]
-            print(f"{DIM}[{status}] {name}{RESET}")
+            # Uncoloured on purpose: the diff type owns the row colours beneath it, and
+            # a header dimmed to match nothing read as less structural than it is.
+            print(f"[{status}] {name}")
         last_scope = scope
     print(render(r, indent='   ' if scope is not None else ''))
 

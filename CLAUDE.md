@@ -65,7 +65,7 @@ The script processes tasks in this pipeline:
 
 5. **Diff** — `diff_scope()` runs **per project scope**, over the union of both sides' scopes. Pass 1 does exact name matching; Pass 2 uses `best_match()` with Jaccard and prefix similarity at 0.7 threshold to relabel close add/delete pairs as "changed". Candidates carry precomputed token sets, and the expensive `prefix_sim()` (difflib) is skipped whenever it cannot change the outcome — different first char, or a similarity ceiling below the running best. Fuzzy matching never crosses a scope, so a task that moved between projects reads as deleted from one and added to the other rather than silently staying put; a scope only one side has yields all-deleted or all-added, which is how a project appearing or disappearing shows up at all.
 
-6. **Output** — Project groups first, sorted by project name; bare rows after, sorted by lowercase task name with `same` last. Coloured by diff type: deleted=RED, added=GREEN, changed=YELLOW, same=DIM; the project header is DIM, because the diff type belongs to the rows beneath it and a project present on one side only is already legible from its children. A header prints only when a row under it survived the filters. Rows are built as dicts by `row()` and turned into text by `render()` at print time, so the text and `--json` modes are rendered from one source and can't drift. The summary line gains an `N projects` field, counting the headers that actually printed — it is text-only, since `--json` already names the project on every row.
+6. **Output** — Project groups first, bare rows after. Projects sort by their own *header* status (`u` before `i` before `p`, from `[order].statuses`) and never by their children's — sorting a project by the statuses inside it would let one urgent task drag a whole project to the top. Rows inside a group go **type, then status, then name**: type outranks status because the question a diff answers is what moved, not what state it is in, and reading straight down the added block then the deleted block is the point of the tool. `TYPE_RANK` fixes that order as added, deleted, changed, same — the same order the summary line lists. Status orders within a type, which is where `[order].statuses` does its work; the lowercase name breaks the last tie. Coloured by diff type: deleted=RED, added=GREEN, changed=YELLOW, same=DIM; the project header is **uncoloured**, because the diff type belongs to the rows beneath it and a header dimmed to match nothing read as less structural than it is. A header prints only when a row under it survived the filters. Rows are built as dicts by `row()` and turned into text by `render()` at print time, so the text and `--json` modes are rendered from one source and can't drift. The summary line gains an `N projects` field, counting the headers that actually printed — it is text-only, since `--json` already names the project on every row.
 
 ## Key flags
 
@@ -79,8 +79,8 @@ to its week**, so a command where no side is a week rejects them outright.
 |------|--------|
 | `-D` | Read only a week's seven daily notes, not its weekly note |
 | `-W` | Read only a week's `YYYY-W##` weekly note, not its dailies |
-| `-T SET` | Show only rows whose type is in a char set (`d`=deleted, `a`=added, `c`=changed, `s`=same, e.g. `dac`); prefix `^` to invert (e.g. `^s`). Summary counts reflect the filtered rows. Default (no `-T`): show all types, with `same` rows sorted after every other row. |
-| `-I` | Hide settled items — the statuses in `[roles] settled` — on the A side only; added and changed rows are always shown. |
+| `-T SET` | Show only rows whose type is in a char set (`d`=deleted, `a`=added, `c`=changed, `s`=same, e.g. `dac`); prefix `^` to invert (e.g. `^s`). Summary counts reflect the filtered rows. Default (no `-T`): show all types, ordered by `[order].statuses`. |
+| `-I` | Hide settled items — any row whose displayed status is in `[roles] settled`, whichever side it came from. |
 | `--routines` | Include `#routine` tasks (excluded by default) |
 | `-S SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`). Filters on the displayed status (B's for added/changed/same, A's for deleted); summary counts reflect the filtered rows. Bare `-S -` needs `-S=-` |
 | `--json` | Emit a JSON document instead of text (implies `--no-color`; `--no-summary` does not apply) |
@@ -166,9 +166,12 @@ day's own list, and deferring something is part of the day.
 done rows rather than nothing. A negated `-S` says only what to drop, so `hide` and `-I`
 still apply to everything it doesn't name.
 
-`-I` is restricted to types 0 and 3 (deleted, same) — the rows whose displayed status
-comes from the settled A side. The diff loop used to re-derive the same rule inline from
-a separate `ignore_set`; it now goes through `suppressed()` like everything else.
+All three ask about the row's **displayed** status (`eff`) and nothing else, which is what
+makes them compose at all. `-I` used to be the exception, restricted to types 0 and 3 on
+the theory that only deleted and same rows read their status off the settled A side — but
+that left `++ [x]` and `~~ [/] → [x]` on screen, which is exactly the work `-I` exists to
+get rid of. A task finished on B is as settled as one finished on A, so the restriction is
+gone and `-I` now hides any settled row.
 
 Filtering happens **after** dedup, so an earlier `[»]` never suppresses a later `[x]`.
 
@@ -295,12 +298,31 @@ Unlike `tcat`, `tdiff` cannot degrade gracefully with *no* config — an empty
 `PROJECT_STATUSES` leaks project headers into every diff — so zero layers is a hard
 `parser.error`. A layer that exists but omits a section degrades with a `notice()`.
 
-Keys read: `[dedup] priority`, `[roles] project|hide|settled`, `[vault]
-daily_folder|weekly_folder`. `[order]` and `[theme.*]` are `tcat`'s and are deliberately
-ignored here — in `tdiff` the diff type owns the row colour, so a status colour would
-have nothing to paint.
+**What still differs from `tcat`, and why.** `config_paths()`, `_merge()` and the
+no-bootstrap rule are byte-identical modulo the tool name, and the layer list is the same
+four. Three deliberate divergences remain, and none of them is drift:
+
+- **Zero layers is fatal here, survivable there.** `tcat` degrades to unranked and
+  uncoloured and says so; `tdiff` cannot, so it `parser.error`s. The config is a
+  **required file**, not an optional one.
+- **`tdiff` reads `[dedup]`, `tcat` reads `[theme.*]` and `[roles] full_row`.** Each tool
+  ignores what it has no use for; the shared table is the superset.
+- **`display_rank()` uses `tcat`'s `UNRANKED = 10 ** 6` sentinel**, same value, so the two
+  order an unlisted status the same way rather than merely both "last".
+
+Keys read: `[dedup] priority`, `[order] statuses`, `[roles] project|hide|settled`,
+`[vault] daily_folder|weekly_folder`. `[theme.*]` is `tcat`'s and is deliberately ignored
+here — in `tdiff` the diff type owns the row colour, so a status colour would have nothing
+to paint. `[order]` used to be ignored for a weaker reason (rows just sorted by name) and
+is now read: it is the one display convention both tools genuinely share, and a `tdiff`
+that sorted differently from `tcat` made the same vault look like two.
 
 ```toml
+[order]
+# Display rank; position in the list is the rank, so `x` sorts last. Unlisted statuses
+# rank after everything, as a block.
+statuses = ["u", "!", "i", "*", ">", "=", "o", "p", " ", "/", "#", "~", "&", "»", "«", "-", "x"]
+
 [dedup]
 # Tiers, highest precedence first; the inner list is a tie (broken by most recent day).
 priority = [["x"], ["-"], ["!", "*", " ", "#", "o"], ["/"], ["&", "»", "«", ">", "=", "~"]]
@@ -315,9 +337,11 @@ settled  = ["x", "-", "&", "»", "«"]
 `[order].statuses` is a display rank that sorts `x` *last*; `[dedup].priority` ranks `x`
 *first*, because "done" is the truest thing you can say about a task also written as
 `[/]` on Tuesday. Same char, opposite ends. A flat list also cannot express ties, and
-this table has three.
+this table has three. Both are read now, at opposite ends of the pipeline: `[dedup]`
+decides which status a row *carries*, `[order]` decides where that row *prints*. A task
+deduped to `[x]` therefore sorts to the bottom, which is the point of having two keys.
 
-`load_config()` populates `STATUS_PRIORITY`, `SETTLED_STATUSES`, `HIDDEN_STATUSES`,
+`load_config()` populates `STATUS_PRIORITY`, `DISPLAY_ORDER`, `SETTLED_STATUSES`, `HIDDEN_STATUSES`,
 `PROJECT_STATUSES`, `DAILY_FOLDER`, `WEEKLY_FOLDER`, `CONFIG_FOUND` right after arg
 parsing, before anything reads them. `DEFAULT_IGNORE` was renamed `SETTLED_STATUSES` to
 match the `[roles]` key it now comes from.
@@ -327,8 +351,12 @@ match the `[roles]` key it now comes from.
 `notice()` collects complaints; `flush_notices()` writes them to stderr at the very end,
 via `finish()`, which every exit path goes through. Suppressed under `--json` and
 `--no-summary` — both mean "output with nothing around it". `report_unlisted()` names
-status chars a run met that no `[dedup]` tier ranks; it subtracts `PROJECT_STATUSES`
-first, since those are excluded from output and never reach a tie-break.
+status chars a run met that the config does not rank, and reports the **two tables
+separately** because a config can easily have one and not the other: missing from
+`[dedup]` a status ranks 0 and loses every tie silently, missing from `[order]` it sorts
+last, which just looks like a choice. It subtracts `PROJECT_STATUSES` from both, since
+those are excluded from output and never reach a tie-break or a sort. `tcat` says the
+same thing about `[order]` in its own `report_unlisted()`.
 
 ## Date formats
 

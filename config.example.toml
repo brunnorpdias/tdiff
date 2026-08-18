@@ -28,7 +28,8 @@ weekly_folder = ""
 
 # Anything from statuses.toml can be overridden here when you want tdiff to differ
 # from the shared table. Lists replace wholesale rather than merging element-wise:
-# naming a partial [dedup].priority means exactly those tiers.
+# naming a partial [dedup].priority means exactly those tiers, and a partial
+# [order].statuses means exactly that order with everything else sorting last.
 #
 # [roles]
 # hide = []          # show overrun/postponed/advanced by default
@@ -36,3 +37,6 @@ weekly_folder = ""
 #
 # [dedup]
 # priority = [["x"], ["-"], [" "]]
+#
+# [order]
+# statuses = ["!", "*", " ", "x"]    # sort rows differently here than in tcat
