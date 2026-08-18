@@ -13,7 +13,8 @@ The flag surface was rebuilt around one idea: **a `w##` names a week, a date nam
 1. **`-F` and `-o` are gone; `-W` is new.** A week is now read whole by default — `tdiff w23 w24` is what `tdiff w23 w24 -F` used to be. `-D` reads only that week's dailies, `-W` only its `YYYY-W##` weekly note, and naming neither reads both. `-o N` was sugar over naming both dates; write `tdiff -7 today` instead of `tdiff today -o -7`.
 2. **`-E` is gone.** It existed because `tdiff` couldn't read a weekly note's *Actio* section and `tcat` could. `tdiff` reads it now, so `-W` covers plan-vs-day directly.
 3. **Projects are shown.** Tasks indented under a project header are grouped under it, and each project is its own dedup and diff scope — a task written both bare and under a project keeps a row in each.
-4. **A week derived from a date stops before that date.** `tdiff wednesday` compares Wednesday against Sunday–Tuesday, not against the whole week. Previously the later days leaked into the comparison; it only looked right for `today`, where the future is empty anyway.
+4. **`w0` means this week.** Weeks can now be named relative to the current one — `w0`, `w-1`, `w+1` — which is what `-o` was reaching for. `w0` previously fell through to the bare-number form and resolved to `YYYY-W00`, a label no calendar produces; nothing useful is lost.
+5. **A week derived from a date stops before that date.** `tdiff wednesday` compares Wednesday against Sunday–Tuesday, not against the whole week. Previously the later days leaked into the comparison; it only looked right for `today`, where the future is empty anyway.
 
 ## Requirements
 
@@ -66,7 +67,7 @@ weekly_folder = ""
 tdiff date_a [date_b] [flags]
 ```
 
-Dates accept `YYYY-MM-DD`, `today`, `yesterday`, `tomorrow`, `0` (today), `-N` / `+N` for N days either way, a weekday name (`monday`..`sunday`, or `mon`..`sun`, resolving to its most recent occurrence at or before today), or `w##` / `w2026-W##` for a Sun-Sat week (e.g. `w20` = week 20 of the current year). `tcat` accepts exactly the same set — the resolver is shared code.
+Dates accept `YYYY-MM-DD`, `today`, `yesterday`, `tomorrow`, `0` (today), `-N` / `+N` for N days either way, a weekday name (`monday`..`sunday`, or `mon`..`sun`, resolving to its most recent occurrence at or before today), or `w##` / `w2026-W##` for a Sun-Sat week (e.g. `w20` = week 20 of the current year). Weeks can also be named relative to this one: `w0` is the current week, `w-1` the one before, `w+1` the one after. `tcat` accepts exactly the same set — the resolver is shared code.
 
 **A date names its daily note; a `w##` names its week.** A week has exactly two sources — its seven daily notes and its `YYYY-W##` weekly note — and `-D` / `-W` read just one of them. Naming neither reads both, which is why the two flags are mutually exclusive: together they'd be a second way to spell the default.
 
@@ -87,6 +88,8 @@ tdiff today -I                 # what is still open this week and not on today's
 tdiff wednesday -D             # any day works, and the week stops before it
 
 tdiff w20                      # week 20's weekly note vs its own daily notes
+tdiff w-1 w0                   # last week vs this week
+tdiff w-1 w0 -D                # ...daily notes only
 tdiff w23 w24                  # full Sun-Sat week 23 vs full week 24
 tdiff w23 w24 -D               # same two weeks, daily notes only
 tdiff w23 w24 -W               # same two weeks, weekly notes only

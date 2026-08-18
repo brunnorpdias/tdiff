@@ -360,7 +360,9 @@ same thing about `[order]` in its own `report_unlisted()`.
 
 ## Date formats
 
-`YYYY-MM-DD`, `today`, `yesterday`, `tomorrow`, `0` (today), `-N`/`+N`, a weekday name (`monday`..`sunday` or `mon`..`sun`, resolving **backwards** to the most recent occurrence at or before today), `w##` or `w2026-W##` (a Sun-Sat week, e.g. `w20` = week 20 of current year). Negative numbers use an internal `__NEG__` token workaround to avoid argparse conflicts.
+`YYYY-MM-DD`, `today`, `yesterday`, `tomorrow`, `0` (today), `-N`/`+N`, a weekday name (`monday`..`sunday` or `mon`..`sun`, resolving **backwards** to the most recent occurrence at or before today), `w##` or `w2026-W##` (a Sun-Sat week, e.g. `w20` = week 20 of current year), or `w0`/`w-1`/`w+1` for a week relative to this one. Negative numbers use an internal `__NEG__` token workaround to avoid argparse conflicts.
+
+**The relative form is checked before the bare number, and the order is load-bearing.** `w0` matches `_WEEK_SHORT_RE` too, where it would resolve to `YYYY-W00` — a label no calendar produces. `_WEEK_REL_RE` is therefore tried first, between the full and short forms. `w-1` needs no `__NEG__` handling: it does not match `-\d+`, so the interception leaves it alone and argparse reads it as a positional rather than a flag. That the `w` prefix is what separates `w-1` (last week) from `-1` (yesterday) is precisely why the offset flags could be dropped.
 
 **A `w##` resolves to the whole week**, `('week', (sunday, anchor, want_dailies, want_weekly))`, not to the weekly note on its own — the `('weekly_file', …)` side kind is gone, folded into `('week', …)` with `want_dailies=False`. This is the one place the two tools' positional grammars now differ in *scope* rather than spelling, and it is what makes `tdiff w23 w24` a full-week comparison with no flag. A date resolves to `('day', …)` and is never promoted; `-D`/`-W` narrow a week that is already there.
 

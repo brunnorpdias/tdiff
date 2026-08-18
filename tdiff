@@ -146,7 +146,10 @@ def load_config(override, error):
     DAILY_FOLDER  = vault.get('daily_folder', '')
     WEEKLY_FOLDER = vault.get('weekly_folder', '')
 
-UNRANKED = 10 ** 6      # tcat's sentinel, same value, so the two sort alike
+# tcat's sentinel, same value, so the two sort alike. Kept on its own line rather than
+# trailing the assignment because tcat's check-core-sync.sh compares whole assignment
+# lines, and a trailing comment would read as drift.
+UNRANKED = 10 ** 6
 
 def display_rank(ch):
     """Sort rank for a status char, from [order].statuses.
@@ -794,6 +797,7 @@ _OFF_RE = re.compile(r'([-+])(\d+)')
 _WEEKDAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 WEEKDAYS = {n[:k]: i for i, n in enumerate(_WEEKDAY_NAMES) for k in (3, len(n))}
 
+_WEEK_REL_RE   = re.compile(r'[wW]([-+]\d+|0)$')
 _WEEK_SHORT_RE = re.compile(r'[wW](\d{1,2})$')
 _WEEK_FULL_RE  = re.compile(r'[wW](\d{4}-W\d{2})$')
 
@@ -829,10 +833,21 @@ def resolve_date(s):
     )
 
 def resolve_week_label(s):
-    """Return 'YYYY-W##' if s is a w## specifier, else None."""
+    """Return 'YYYY-W##' if s is a w## specifier, else None.
+
+    Three spellings, tried in this order. `w2026-W30` names a week outright. `w-1` / `w0`
+    / `w+1` are relative to the week containing today, and are what replaced the offset
+    flags both tools used to carry. `w30` is a bare week number in the current year.
+
+    The relative form has to be tried before the bare number, or `w0` would read as week
+    zero — a week no calendar has, and one that used to resolve to a phantom label.
+    """
     m = _WEEK_FULL_RE.fullmatch(s)
     if m:
         return m.group(1)
+    m = _WEEK_REL_RE.fullmatch(s)
+    if m:
+        return week_span(date.today() + timedelta(weeks=int(m.group(1))))[2]
     m = _WEEK_SHORT_RE.fullmatch(s)
     if m:
         return f'{date.today().year}-W{int(m.group(1)):02d}'
