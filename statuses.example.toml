@@ -87,8 +87,8 @@ full_row = ["x", "-"]
 
 # Hidden by -I in both tools: work that has reached a terminal state, in either
 # direction. The default view still shows x and - (greyed across the whole row, see
-# full_row); -I is for when you want only what is still open. In tdiff it applies to
-# the settled (A) side only, so added and changed rows are never hidden by it.
+# full_row); -I is for when you want only what is still open. Both tools ask about the
+# status a row actually displays, so a task finished on either side of a diff is hidden.
 #
 # Kept separate from full_row on purpose — that key says how a row is *painted*,
 # this one says whether it is *there*. Welding them would mean a colour change
