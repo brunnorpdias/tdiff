@@ -158,7 +158,7 @@ The script processes tasks in this pipeline:
    **Dedup is scoped.** It runs **once per project scope**, never once per side. Scopes never merge, exactly as in `tcat`: a task written both bare and under a project keeps a row in each, because the header is real context and a bare occurrence should not swallow a project's copy. `fetch_side()` returns `{scope_key: (display_name, header_status, tasks, order)}`. The invariant to hold onto is that scoping only ever *adds* rows.
 
 
-4. **Week aggregation** (`side_entries()` / `week_entries()`, materialized by `fetch_side()`) — a `('week', (sunday, anchor, want_dailies, want_weekly))` side reads up to 7 daily notes plus the `YYYY-W##` weekly note at `day_index=0` (lowest dedup priority among the 7 days — losing ties against any daily note). `want_dailies` / `want_weekly` come from `-D`/`-W`; `anchor` bounds the week strictly before a date. Missing notes are silently skipped.
+4. **Week aggregation** (`side_entries()` / `week_entries()`, materialized by `fetch_side()`) — a `('week', (sunday, anchor, want_dailies, want_weekly))` side reads up to 7 daily notes plus the `YYYY-W##` weekly note at `day_index=0` (lowest dedup priority among the 7 days — losing ties against any daily note). `want_dailies` / `want_weekly` come from `-D`/`-W`; `anchor` bounds the week: the dailies stop strictly before the date, the weekly note keeps that date's own allocation. Missing notes are silently skipped.
 
 5. **Diff** — `diff_scope()` runs **per project scope**, over the union of both sides' scopes. Pass 1 does exact name matching; Pass 2 uses `best_match()` with Jaccard and prefix similarity at 0.7 threshold to relabel close add/delete pairs as "changed". Candidates carry precomputed token sets, and the expensive `prefix_sim()` (difflib) is skipped whenever it cannot change the outcome — different first char, or a similarity ceiling below the running best. Fuzzy matching never crosses a scope, so a task that moved between projects reads as deleted from one and added to the other rather than silently staying put; a scope only one side has yields all-deleted or all-added, which is how a project appearing or disappearing shows up at all.
 
@@ -195,7 +195,11 @@ Worth stating, because each one decided a case that would otherwise look arbitra
 - **Earliest on the left.** Where the user did not fix the order, the side that came
   first takes A: the weekly note precedes the week it plans, the days before a date
   precede that date. Two positionals are always taken in the order written.
-- **"Up to" is exclusive.** A week derived from a date stops strictly before it.
+- **"Up to" is exclusive — of the *notes*, not of the plan.** A week derived from a date
+  reads dailies Sunday→date−1, so nothing is compared against itself. The weekly note's
+  allocation *for* that date is kept: it is not a copy of the day's list, it is what the
+  day was supposed to be, and it is the only thing that makes a task the plan set for
+  today and never carried over show up at all.
 
 ### One positional: exclusion and truncation
 
@@ -216,10 +220,23 @@ leaves exactly the two sources, one per side, and is why a lone `w##` *rejects* 
 either would empty a side. The weekly note takes the A side because it is what was
 written first.
 
-**A week derived from a date stops strictly before it**, on both sources: the dailies run
-Sunday→anchor−1, and `weekly_mode(until)` passes `skip_days = WEEK_DAYS[idx:]` to drop
-every task allocated to the anchor's own day or later. Nothing dated after a day
-can be outstanding as of it. This is not just about self-comparison: under the old
+**A week derived from a date stops before it, and the two sources stop at different
+places.** The dailies run Sunday→anchor−1: the anchor's own note is the B side, so
+reading it into A would compare it against itself. `weekly_mode(until)` passes
+`skip_days = WEEK_DAYS[idx + 1:]`, dropping only what is allocated *after* the anchor —
+nothing dated after a day can be outstanding as of it.
+
+**The anchor's own allocation is kept, and that asymmetry is the point.** It used to be
+dropped too, for symmetry with the dailies, which reads as principled and is wrong: the
+weekly note's block for today is not a copy of today's list, it is what today was
+*supposed* to be. Dropping it made every task the plan set for today read as `added`,
+and silently hid the one case `tdiff today` exists to catch — a task the plan assigned
+to today that never made it onto today's list, which now shows as `deleted`. On
+2026-08-24 that was the difference between `11 added · 2 same` and `2 added · 11 same`.
+
+This stayed invisible until `[days]` worked. `MARK_RE` matched `**monday**` and not the
+wikilink form, so no day ever opened and the weekly note contributed its whole plan
+whatever the anchor — the right output for entirely the wrong reason. This is not just about self-comparison: under the old
 anchor-only exclusion `tdiff wednesday -D` read Thursday and Friday into the A side, and
 that looked correct for a bare `today` purely because tomorrow's note is usually empty. A
 `w##` has no date to stop at, so its week is read whole.
@@ -239,7 +256,7 @@ marker spelling.
 
 What survives is the **day ladder**, and only to answer one question: was a task
 allocated to a day at or after the anchor? `weekly_mode(until)` returns
-`{'skip_days': WEEK_DAYS[idx:]}` and nothing else; with no anchor it returns `{}`.
+`{'skip_days': WEEK_DAYS[idx + 1:]}` and nothing else; with no anchor it returns `{}`.
 
 **`[days]` says what a marker looks like.** The keys are the seven canonical day names,
 because the code has to order them to know what "at or after" means; every value is a

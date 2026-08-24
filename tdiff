@@ -36,7 +36,7 @@ SHOW_ALL = False
 # `[exclude] sections` says either.
 DAY_MODE = {}
 
-def weekly_mode(until=None):
+def weekly_mode(until=None, only_anchor=False):
     """Read kwargs for a YYYY-W## weekly note.
 
     There is nothing left to say about *which* sections to read: the note is read
@@ -45,16 +45,32 @@ def weekly_mode(until=None):
     day markers, both spelled into the source — so a plan parked under a heading this
     file had never heard of was unreachable however the config was written.
 
-    What survives is the day ladder, and only for `until`: a week derived from a date
-    anchor stops strictly before it, so tasks allocated to that day or later are
-    dropped. Nothing allocated to Thursday is outstanding on Wednesday. Tasks under no
-    marker at all are never dropped — most of a week being planned is unallocated, and
-    an unallocated task has no day to be late for.
+    What survives is the day ladder, and only for `until`: tasks allocated to a day
+    *after* the anchor are dropped, because nothing allocated to Thursday is
+    outstanding on Wednesday. Tasks under no marker at all are never dropped — most of
+    a week being planned is unallocated, and an unallocated task has no day to be late
+    for.
+
+    **The anchor's own day is kept, and that is the one place the exclusive bound does
+    not apply.** It used to be dropped, on the reading that a week derived from a date
+    stops strictly *before* it. That rule is right about the daily notes — they run
+    Sunday→anchor−1, so the anchor's own note stays on the B side and nothing is
+    compared against itself — but it is wrong here, because the weekly note's
+    allocation for today is not a copy of today's list. It is what today was *supposed*
+    to be. Dropping it made every task the plan set for today read as `added` and
+    silently hid the one thing `tdiff today` exists to catch: a task the plan assigned
+    to today that never made it onto today's list, which shows as `deleted`.
+
+    This was invisible until [days] worked. The old matcher took `**monday**` and not
+    the wikilink form, so no day ever opened and the weekly note contributed its whole
+    plan whatever the anchor — which looked correct for exactly the wrong reason.
     """
     if until is None:
         return {}
     idx = (date.fromisoformat(until).weekday() + 1) % 7
-    return {'skip_days': tn.WEEK_DAYS[idx:]}
+    if only_anchor:
+        return {'only_days': (tn.WEEK_DAYS[idx],)}
+    return {'skip_days': tn.WEEK_DAYS[idx + 1:]}
 
 def _parse_obsidian(file_path, day_index, read_kwargs):
     """Yield (scope_key, scope_name, status, base, status_char, day_index) records.
@@ -113,7 +129,8 @@ def week_entries(sunday, anchor=None, want_dailies=True, want_weekly=True):
             entries.append((tn.daily_path(d), i, DAY_MODE))
     if want_weekly:
         _, _, week_label = tn.week_span(sunday)
-        entries.append((tn.weekly_path(week_label), 0, weekly_mode(anchor)))
+        entries.append((tn.weekly_path(week_label), 0,
+                        weekly_mode(anchor, only_anchor=not want_dailies)))
     return entries
 
 def side_entries(side):
