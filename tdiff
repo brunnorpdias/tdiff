@@ -28,12 +28,15 @@ DISPLAY_ORDER    = {}
 SETTLED_STATUSES = set()
 HIDDEN_STATUSES  = set()
 PROJECT_STATUSES = set()
+EXCLUDED_SECTIONS = ()
 DAILY_FOLDER  = ''
 WEEKLY_FOLDER = ''
 CONFIG_FOUND  = False
 
-# Set from --routines once args are parsed; read by _parse_obsidian() at call time.
+# Set from --routines / --all once args are parsed; read by _parse_obsidian() at call
+# time.
 INCLUDE_ROUTINES = False
+SHOW_ALL = False
 
 # Complaints worth making but not worth interrupting for. Collected during the run
 # and flushed to stderr at the end by flush_notices(), so they never interleave with
@@ -96,7 +99,8 @@ def load_config(override, error):
     owns the row colour, so a status colour would have nothing to paint.
     """
     global STATUS_PRIORITY, DISPLAY_ORDER, SETTLED_STATUSES, HIDDEN_STATUSES
-    global PROJECT_STATUSES, DAILY_FOLDER, WEEKLY_FOLDER, CONFIG_FOUND
+    global PROJECT_STATUSES, EXCLUDED_SECTIONS, DAILY_FOLDER, WEEKLY_FOLDER
+    global CONFIG_FOUND
 
     merged = {}
     for path in config_paths(override):
@@ -141,6 +145,18 @@ def load_config(override, error):
     HIDDEN_STATUSES  = set(roles.get('hide', []))
     if not PROJECT_STATUSES:
         notice('no [roles] project in config — project rows will not be excluded')
+
+    # Sections never read. A '>' separates outline ancestors and every component is
+    # normalised on the way in, so the config may spell one "*Actio Fixa*", "actio fixa"
+    # or "actio > **fixa**" indifferently. No notice for an empty list: fences already
+    # skip a frozen snapshot, so naming one is how a vault stops relying on that, not a
+    # thing every vault must do.
+    paths = []
+    for raw in merged.get('exclude', {}).get('sections', []):
+        parts = tuple(p for p in (_norm_heading(x) for x in str(raw).split('>')) if p)
+        if parts:
+            paths.append(parts)
+    EXCLUDED_SECTIONS = tuple(paths)
 
     vault = merged.get('vault', {})
     DAILY_FOLDER  = vault.get('daily_folder', '')
@@ -196,21 +212,53 @@ def _tokens(s):
 # one name and one shape no matter which tool asked. Any change lands in both.
 
 TASK_RE = re.compile(r'^(\s*)- (\[.\]) (.+)$')
-H2_RE   = re.compile(r'^##\s+\*(\w+)\*')
-H3_RE   = re.compile(r'^###\s+\*(\w+)\*')
 MARK_RE = re.compile(r'^\*{2,3}([a-z]+)\*{2,3}\s*$')
 FENCE_RE = re.compile(r'^\s*(?:```|~~~)')
 MDLINK_RE = re.compile(r'\[([^\[\]]+)\]\([^()]*\)')
 
-# The weekly day ladder. A whitelist, never a blacklist — the weekly template
-# gains sections over time, and this is what keeps Ratio's **rationes** lines and
-# Mensis's prospect checkboxes out of every day.
-#
-# WEEK_DAYS is the ladder's day span on its own: -A asks for all seven at once,
-# and deriving LADDER from it keeps the two from drifting apart.
+# Any heading, at any level, however it is written — `## *Actio Fixa*` and the older
+# templates' unadorned `## Reflectio Vespertina` alike, since a config has to be able
+# to name either. This replaced a pair of matchers that wanted a single italicised
+# word and drove a region whitelist; sections are named in config now, so a heading's
+# only remaining job is to bound a section and reset the day ladder.
+HEAD_RE = re.compile(r'^(#{1,6})\s+(.+?)\s*$')
+
+# A line that is nothing but bold text. Every such line is an outline node one level
+# below any heading, which is what lets a config name `**future**` the same way it
+# names `### Backlog` — the vault decides which it uses, not this tool. Kept apart
+# from MARK_RE, which reads WEEK_DAYS for the anchor bound: the outline is bookkeeping
+# for exclusion alone and cannot disturb a week diff.
+BOLD_RE = re.compile(r'^\*{2,3}([^*].*?)\*{2,3}\s*$')
+
+OUTLINE_BOLD = 7   # deeper than ###### so a bold marker nests under any heading
+
+def _excluded(path, patterns):
+    """Does the just-entered node at `path` open an excluded section? A pattern names
+    an ancestor chain read outward-in ('actio > future'); intervening levels are
+    allowed, so it survives a heading being added above or between."""
+    for pat in patterns:
+        if pat[-1] != path[-1]:
+            continue
+        it = iter(path[:-1])
+        if all(p in it for p in pat[:-1]):
+            return True
+    return False
+
+def _norm_heading(s):
+    """'## *Actio Fixa*' -> 'actio fixa'. Emphasis, backticks and case are formatting,
+    not name: the config names a section the way a person would say it, and all of
+    "*Actio Fixa*", "Actio Fixa" and "actio fixa" have to mean the same section."""
+    s = s.replace('*', '').replace('_', '').replace('`', '')
+    return ' '.join(s.split()).lower()
+
+# The weekly day ladder: which **weekday** marker a planned task sits under. This is
+# the only thing the weekly note's structure is still read for — enough to answer "was
+# this allocated to a day at or after the anchor", which is what stops a week derived
+# from a date before that date. It is no longer a whitelist: sections are named in
+# [exclude] sections or they are read, and a note's headings are not the tool's
+# business beyond resetting the ladder.
 WEEK_DAYS = ('sunday', 'monday', 'tuesday', 'wednesday',
              'thursday', 'friday', 'saturday')
-LADDER = ('promissum',) + WEEK_DAYS + ('future',)
 
 def clean_text(s):
     """Un-escape Obsidian's bracket escapes, drop a trailing ' – ...' section suffix,
@@ -234,31 +282,36 @@ def clean_text(s):
     s = normalize_wikilinks(s)
     return MDLINK_RE.sub(lambda m: m.group(1), s)
 
-def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
+def parse_note(lines, routines=False, exclude=(), skip_days=()):
     """Yield (indent, status_char, name, seq) for tasks in a note.
 
+    exclude: outline paths ([exclude] sections) that are never read. A node is a
+    heading at any level or a bold-only line, so `fixa`, `actio fixa` and
+    `actio > future` all name something; a section runs until the next node at the
+    same or shallower level, and the opening line is swallowed so an excluded section
+    cannot set the day ladder either.
+
     A fenced block is not content: ``` / ~~~ toggle, and nothing inside is parsed —
-    not tasks, not headings, not ladder markers. Fencing is how the vault freezes a
-    task list: ### *Fixa* and a daily's ## *Actio Fixa* are whole fenced snapshots,
-    and a **future** bucket is often parked in a ```markdown block. Reading those
-    back as live tasks reported a day's frozen copy of the week as work of its own
-    (2026-05-17 alone carried 91 such lines). This parser used to ignore fences
-    outright; that was safe only while the reader was `obsidian tasks`, which never
-    handed the fenced lines over in the first place.
+    not tasks, not headings, not bold lines. Fencing is how a vault freezes a task
+    list, and reading one back reports a day's frozen copy of the week as work of its
+    own (tdiff 2026-05-17 2026-05-18 gave 89 rows where 19 are real). This parser used
+    to ignore fences outright, which was safe only while the reader was `obsidian
+    tasks` — that CLI never handed the fenced lines over.
 
-    region/day: when both are given, only tasks under that ### heading and that
-    ladder marker are yielded (weekly mode). `day` takes one marker name or a
-    tuple of them — WEEK_DAYS folds the whole week into one pass, which is what
-    -A -P wants. When neither is given, every task in the note is yielded (daily
-    mode).
+    `exclude` is the filter for everything that is *not* fenced, and the durable one:
+    a section is skipped because of what it is called, not because of how it happens
+    to be formatted. Nothing is special-cased by name — a deferral bucket is reached
+    as `actio > future` or `backlog`, whichever the vault writes.
 
-    skip_future: drop tasks sitting under a **future** marker. Only -A passes it.
-    A daily note's future bucket is fair to show for that one day, but aggregating
-    a week would fold deferred work in alongside what actually happened — and a
-    pre-split Sunday's bucket holds a whole week of it.
+    skip_days: **weekday** marker names whose tasks are dropped. Only weekly_mode
+    passes it, and only to enforce the anchor bound — a task allocated to Thursday is
+    not outstanding on Wednesday. It is a blacklist of named days, not a whitelist of
+    readable sections: which sections a note has is the vault's business, and
+    `exclude` is where it says so.
     """
-    days = (day,) if isinstance(day, str) else day
-    cur_region = cur_day = None
+    cur_day = None
+    outline = []        # (level, name) of every enclosing node, outermost first
+    excl_depth = None   # depth of the excluded node we are inside, if any
     in_fence = False
     seq = 0
     for line in lines:
@@ -267,29 +320,35 @@ def parse_note(lines, region=None, day=None, routines=False, skip_future=False):
             continue
         if in_fence:
             continue
-        if H2_RE.match(line):
-            cur_region = cur_day = None
-            continue
-        m = H3_RE.match(line)
+        m = HEAD_RE.match(line)
         if m:
-            cur_region = m.group(1).lower()
-            cur_day = None
+            lvl, title = len(m.group(1)), _norm_heading(m.group(2))
+        else:
+            m = BOLD_RE.match(line)
+            lvl, title = (OUTLINE_BOLD, _norm_heading(m.group(1))) if m else (None, None)
+        if lvl is not None:
+            while outline and outline[-1][0] >= lvl:
+                outline.pop()
+            outline.append((lvl, title))
+            if lvl < OUTLINE_BOLD:
+                cur_day = None   # a heading of any level ends the day ladder
+            # A node at or above the excluded one ends it — a sibling included.
+            if excl_depth is not None and len(outline) <= excl_depth:
+                excl_depth = None
+            if excl_depth is None and _excluded([n for _, n in outline], exclude):
+                excl_depth = len(outline)
+        if excl_depth is not None:
             continue
         m = MARK_RE.match(line)
-        if m and m.group(1) in LADDER:
-            # Once inside **future**, stay there: a future fence may carry its own
-            # **sunday**/**other** markers that must not re-enter the ladder.
-            if cur_day != 'future':
-                cur_day = m.group(1)
+        if m:
+            cur_day = m.group(1) if m.group(1) in WEEK_DAYS else None
             continue
         m = TASK_RE.match(line)
         if not m:
             continue
         if not routines and '#routine' in line:
             continue
-        if skip_future and cur_day == 'future':
-            continue
-        if region is not None and (cur_region != region or cur_day not in days):
+        if cur_day in skip_days:
             continue
         seq += 1
         yield len(m.group(1)), m.group(2)[1], clean_text(m.group(3)), seq
@@ -466,39 +525,35 @@ def prefetch(paths):
 # How each kind of note is read. The kwargs travel with the note in side_entries(),
 # because what a note means depends on which side asked for it, not on its name.
 #
-# A bare day side reads the whole daily note, future bucket included — it is that one
-# day's own list, and deferring something is part of the day. The same note inside a
-# week aggregation drops **future**, because folding seven days together would
-# otherwise pull deferred work in beside what actually happened, and a pre-split
-# Sunday's bucket holds a whole week of it.
-DAY_MODE      = {}
-WEEK_DAY_MODE = {'skip_future': True}
+# A daily note is read whole, whether it is a side of its own or one of seven folded
+# into a week. It used to drop **future** in the week case, on the reasoning that
+# folding seven days together pulls deferred work in beside what actually happened.
+# That reasoning was sound for this vault and wrong as a rule: it hardcoded both that
+# a bucket named "future" exists and what it means. A vault that calls it `### backlog`
+# was unreachable, and one that wants it folded in could not say so. `[exclude]
+# sections` says either — and a fenced bucket needs neither, being skipped already.
+DAY_MODE = {}
 
 def weekly_mode(until=None):
-    """Read kwargs for a YYYY-W## weekly note: the ### *Actio* section — the week's
-    plan. The rest of the note (Impressio, Relatio, Cultus, Fixa) is structure and
-    reference, not work assigned to this week, and used to leak into every week diff.
+    """Read kwargs for a YYYY-W## weekly note.
 
-    `None` leads the day whitelist on purpose, and is the one divergence from tcat's
-    -A -P. Actio's seven **weekday** markers are an *optional* second pass: a week is
-    planned by listing tasks under the heading, and only some of them ever get
-    allocated to a named day. On an organised week (W30, W32) every task carries a
-    marker and the `None` entry matches nothing; on a week still being drafted (W31,
-    W33) *everything* sits unallocated, and asking for WEEK_DAYS alone would report an
-    empty plan against a section holding dozens of tasks. Reading the unallocated ones
-    is what lets tdiff see a week you are still writing.
+    There is nothing left to say about *which* sections to read: the note is read
+    whole, like a daily one, and a vault that wants Fixa or Relatio kept out names them
+    in [exclude] sections. This used to pin the read to `### *Actio*` and to a
+    whitelist of **weekday** markers, which quietly decided that a plan lives under a
+    heading spelled one particular way — so a plan parked in a sibling section
+    (`### *futura*` here) was unreachable however the config was written.
 
-    `until` (ISO date) stops the whitelist strictly before that day's marker, so a
-    week derived from a date anchor covers only what was due ahead of it. Nothing
-    allocated to Thursday is outstanding on Wednesday.
-
-    **future** is excluded either way — it is the deferral bucket, not this week — and
-    the whitelist does that on its own, since 'future' is simply not in the tuple.
+    What survives is the day ladder, and only for `until`: a week derived from a date
+    anchor stops strictly before it, so tasks allocated to that day or later are
+    dropped. Nothing allocated to Thursday is outstanding on Wednesday. Tasks under no
+    marker at all are never dropped — most of a week being planned is unallocated, and
+    an unallocated task has no day to be late for.
     """
-    days = WEEK_DAYS
-    if until is not None:
-        days = WEEK_DAYS[:(date.fromisoformat(until).weekday() + 1) % 7]
-    return {'region': 'actio', 'day': (None,) + days}
+    if until is None:
+        return {}
+    idx = (date.fromisoformat(until).weekday() + 1) % 7
+    return {'skip_days': WEEK_DAYS[idx:]}
 
 def _parse_obsidian(file_path, day_index, read_kwargs):
     """Yield (scope_key, scope_name, status, base, status_char, day_index) records.
@@ -517,7 +572,8 @@ def _parse_obsidian(file_path, day_index, read_kwargs):
     """
     scope_key = scope_name = scope_status = None
     for indent, status_char, name, _seq in parse_note(
-            obsidian_lines(file_path), routines=INCLUDE_ROUTINES, **read_kwargs):
+            obsidian_lines(file_path), routines=INCLUDE_ROUTINES,
+            exclude=() if SHOW_ALL else EXCLUDED_SECTIONS, **read_kwargs):
         base = _NEW_PREFIX_RE.sub('', name)
         if indent == 0:
             if status_char in PROJECT_STATUSES:
@@ -646,7 +702,7 @@ def week_entries(sunday, anchor=None, want_dailies=True, want_weekly=True):
             d = (sunday + timedelta(days=i)).isoformat()
             if anchor is not None and d >= anchor:
                 break
-            entries.append((daily_path(d), i, WEEK_DAY_MODE))
+            entries.append((daily_path(d), i, DAY_MODE))
     if want_weekly:
         _, _, week_label = week_span(sunday)
         entries.append((weekly_path(week_label), 0, weekly_mode(anchor)))
@@ -776,6 +832,9 @@ _week_flags.add_argument('-D', '--dailies', action='store_true',
 _week_flags.add_argument('-W', '--weekly', action='store_true',
                     help="read only the week's YYYY-W## weekly note, not its dailies")
 parser.add_argument('--routines',         action='store_true', help='include #routine tasks')
+parser.add_argument('--all',              action='store_true', dest='show_all',
+                    help='ignore [exclude] sections; fenced blocks are still '
+                         'skipped')
 parser.add_argument('--json',             action='store_true',
                     help='emit a machine-readable JSON document instead of text '
                          '(implies --no-color; --no-summary does not apply)')
@@ -792,6 +851,7 @@ raw = sys.argv[1:]
 safe = [('__NEG__' + a[1:]) if re.fullmatch(r'-\d+', a) else a for a in raw]
 args = parser.parse_args(safe)
 
+SHOW_ALL = args.show_all
 load_config(args.config, parser.error)
 INCLUDE_ROUTINES = args.routines
 

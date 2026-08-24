@@ -42,33 +42,62 @@ scope is closing too eagerly.
 
 ## Architecture
 
-The entire tool lives in a single executable file: `tdiff` (~1250 lines, Python 3).
+The entire tool lives in a single executable file: `tdiff` (~1300 lines, Python 3).
 
 The script processes tasks in this pipeline:
 
 1. **Read** — `_run_obsidian()` execs `obsidian read file=<name>` directly (no shell, no pipe), returning the note's **raw markdown**. Failures are fatal, never silent: a missing `obsidian` binary, a non-zero exit, an `Error:` line, or a stalled call all print `tdiff: ...` to stderr and exit 2. Only obsidian's `Error: File "X" not found.` is treated as an empty note (days without notes and missing weekly notes stay silent) — and only on the **first** line, because on raw markdown a note that happens to open a line with `Error:` would otherwise be misread as a failed read. `obsidian_lines()` memoizes per file path and `prefetch()` warms that cache concurrently (`FETCH_WORKERS` threads), submitting `obsidian_lines` itself so the vault read has exactly one seam — the concurrent path used to call `_run_obsidian` directly, leaving a second entry point that anything hooking the read would miss — every vault read for both sides of a comparison is issued in one batch, which is where most of the wall-clock went. See **Obsidian CLI stalls** below.
 
-   **`read`, not `tasks`.** The flat task list `obsidian tasks` returns has already thrown away the headings, and the ladder markers under `### *Actio*` are the only thing that says which of a weekly note's tasks are the week's plan. `tcat` has always read raw markdown for that reason; moving `tdiff` onto it is what stopped the two tools disagreeing about what a note contains.
+   **`read`, not `tasks`.** The flat task list `obsidian tasks` returns has already thrown away the headings, and a heading is what an exclude list names; the `**weekday**` markers it also drops are what say when a planned task was due. `tcat` has always read raw markdown for that reason; moving `tdiff` onto it is what stopped the two tools disagreeing about what a note contains.
 
 2. **Parse** — `parse_note()` turns markdown into `(indent, status_char, name, seq)` tuples; `_parse_obsidian()` adapts those to `(scope_key, scope_name, scope_status, base, status, day_index)` records. `parse_note` was **vendored verbatim into `tcat`** alongside the date core (see **Date formats**) and has now diverged there too — see **Fenced blocks** below; `clean_text` diverged earlier (see **Task names** below). `#routine` lines are dropped unless `--routines` is passed. Statuses are stored **bracketed** (`'[x]'`, not `'x'`); `parse_note` yields the bare char, so `_parse_obsidian` re-brackets — every consumer downstream indexes `[1]` for the char, so a record source that forgets this fails silently rather than loudly.
 
-   **Fenced blocks are skipped.** ` ``` ` / `~~~` toggle `in_fence`, and nothing inside
-   is parsed — not tasks, not headings, not ladder markers. Fencing is how the vault
+   **Fenced blocks are skipped.** ` ``` ` / `~~~` toggle `in_fence`, and nothing
+   inside is parsed — not tasks, not headings, not bold lines. Fencing is how the vault
    freezes a task list: `### *Fixa*` and a daily's `## *Actio Fixa*` are whole fenced
-   snapshots, and a `**future**` bucket is often parked in a ` ```markdown ` block.
-   `parse_note` used to ignore fences outright, which was harmless only while the reader
-   was `obsidian tasks` — that CLI never handed the fenced lines over. Reading raw
-   markdown made them live tasks again: `tdiff 2026-05-17 2026-05-18` reported 89 rows
-   where 19 are real, the other 70 being that day's frozen copy of the week. Weekly-mode
-   reads never showed it, because Actio's region and day whitelist already dropped both
-   Fixa and future — which is why it only surfaced on daily notes.
+   snapshots. `parse_note` used to ignore fences outright, which was harmless only
+   while the reader was `obsidian tasks` — that CLI never handed the fenced lines over.
+   Reading raw markdown made them live tasks again: `tdiff 2026-05-17 2026-05-18`
+   reported 89 rows where 19 are real, the other 70 being that day's frozen copy of the
+   week. Every fence in the vault is balanced and none nests, so a plain toggle is
+   enough; an unbalanced one would swallow the rest of a note, and nothing detects that.
 
-   Every fence in the vault is balanced and none nests, so a plain toggle is enough; an
-   unbalanced one would swallow the rest of a note, and nothing detects that.
+   **`[exclude] sections` is the filter for everything that is not fenced**, and the
+   durable one: a section is skipped because of what it is called, not because of how
+   it happens to be formatted. It applies to every note, daily and weekly — `exclude`
+   rides on every `parse_note` call — and takes everything nested inside a named
+   section with it. `--all` ignores the list for one run; it does **not** lift the
+   fence.
+
+   It is also the *only* filter of its kind. A weekly note used to be pinned to its
+   `### *Actio*` section and to a whitelist of `**weekday**` markers, which decided on
+   the tool's behalf that a plan lives under a heading spelled one particular way. A
+   plan parked in a sibling section was then unreachable however the config was
+   written — this vault writes `### *futura*` as an H3 beside `### *Actio*`, and
+   nothing under it could be seen. Both whitelists are gone; a note is read whole and
+   the config says what to leave out.
+
+   **The outline.** `HEAD_RE` (`^(#{1,6})\s+(.+?)\s*$`) and `BOLD_RE` (a line that is
+   nothing but bold text) make every heading and every bold-only line a node; a bold
+   node sits at `OUTLINE_BOLD = 7`, below any heading, so `**future**` nests under
+   `### *Actio*` and `actio > future` addresses it. `_norm_heading` strips emphasis,
+   backticks and case, which is what lets a vault move a bucket from `**future**` to
+   `### backlog` and change one word of config. `_excluded` matches a pattern as an
+   ancestor chain with intervening levels allowed, so inserting a heading above one
+   does not break it. A section ends at the next node at the same or shallower level,
+   and the opening line is swallowed so an excluded section cannot set the day ladder
+   either.
+
+   `HEAD_RE` replaced a pair of matchers (`H2_RE`/`H3_RE`) that wanted a single
+   italicised word and drove the region whitelist. They could not see `## *Actio Fixa*`
+   or the older templates' unadorned `## Reflectio Vespertina` — precisely the sections
+   a config needs to name — so widening was never the fix; deleting the whitelist they
+   fed was. `MARK_RE` survives, now reading `WEEK_DAYS` directly rather than a `LADDER`
+   tuple, and its only consumer is the anchor bound.
 
    **Project grouping happens here, per note.** A task at indent 0 whose status is in `[roles] project` opens a scope and is not itself yielded; indented tasks join it; any other indent-0 task closes it and joins the bare scope (`scope_key = None`). Doing it inside the per-note loop is not incidental: a week side concatenates eight notes, and a header left open at the end of one would otherwise adopt the next note's children. `tcat`'s `build_groups` never faces that, seeing one note at a time.
 
-   **How a note is read travels with it** as parse kwargs in `side_entries()`, because what a note means depends on which side asked for it, not on its name. `DAY_MODE` reads a whole daily note; `WEEK_DAY_MODE` reads one inside a week aggregation, minus `**future**`; `weekly_mode(until)` reads a `YYYY-W##` note's `### *Actio*` section. See **Reading the weekly note** below.
+   **How a note is read travels with it** as parse kwargs in `side_entries()`, because what a note means depends on which side asked for it, not on its name. `DAY_MODE` reads a whole daily note, and one inside a week aggregation too — identically, because dropping `**future**` there hardcoded both that such a bucket exists and what it means; `weekly_mode(until)` reads a `YYYY-W##` note whole too, adding only the anchor's day bound. See **Reading the weekly note** below.
 
 3. **Deduplicate** — `cluster_records()` uses union-find to merge task variants across days. Two bases are the same task if their token sets are identical OR one is a strict subset sharing the same first word. Rather than scanning all pairs, it buckets bases by token-set (equality merges) and by first token (subset merges) — same clusters, far fewer comparisons. `materialize()` picks the canonical form (most recent day, longest on tie) and winning status by `STATUS_PRIORITY`, which comes from `[dedup].priority` in the config.
 
@@ -96,6 +125,7 @@ to its week**, so a command where no side is a week rejects them outright.
 | `-T SET` | Show only rows whose type is in a char set (`d`=deleted, `a`=added, `c`=changed, `s`=same, e.g. `dac`); prefix `^` to invert (e.g. `^s`). Summary counts reflect the filtered rows. Default (no `-T`): show all types, ordered by `[order].statuses`. |
 | `-I` | Hide settled items — any row whose displayed status is in `[roles] settled`, whichever side it came from. |
 | `--routines` | Include `#routine` tasks (excluded by default) |
+| `--all` | Ignore `[exclude] sections` for one run. Fenced blocks are still skipped |
 | `-S SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`). Filters on the displayed status (B's for added/changed/same, A's for deleted); summary counts reflect the filtered rows. Bare `-S -` needs `-S=-` |
 | `--json` | Emit a JSON document instead of text (implies `--no-color`; `--no-summary` does not apply) |
 | `--no-color` | Disable ANSI colors |
@@ -134,8 +164,8 @@ either would empty a side. The weekly note takes the A side because it is what w
 written first.
 
 **A week derived from a date stops strictly before it**, on both sources: the dailies run
-Sunday→anchor−1, and `weekly_mode(until)` truncates Actio's whitelist to
-`(None,) + WEEK_DAYS[:idx]`, one marker short of the anchor. Nothing dated after a day
+Sunday→anchor−1, and `weekly_mode(until)` passes `skip_days = WEEK_DAYS[idx:]` to drop
+every task allocated to the anchor's own day or later. Nothing dated after a day
 can be outstanding as of it. This is not just about self-comparison: under the old
 anchor-only exclusion `tdiff wednesday -D` read Thursday and Friday into the A side, and
 that looked correct for a bare `today` purely because tomorrow's note is usually empty. A
@@ -147,30 +177,44 @@ comparison would be a no-op.
 
 ### Reading the weekly note
 
-A `YYYY-W##` note is read as its **`### *Actio*` section only** — the week's plan. The
-rest (Impressio, Relatio, Cultus, Fixa) is structure and reference, not work assigned to
-this week, and it used to leak into every week diff back when the reader returned a flat
-task list with the headings already discarded.
+A `YYYY-W##` note is **read whole**, exactly like a daily one. It used to be pinned to
+its `### *Actio*` section and, within that, to a whitelist of `**weekday**` markers.
+Both are gone, and the reason is worth keeping: each decided on the tool's behalf where
+a plan lives. This vault writes `### *futura*` as an H3 beside `### *Actio*`, and
+nothing under it could be reached however the config was written — the whitelist ran
+before any config did. A vault says what to leave out in `[exclude] sections` now, and
+that is the whole of it.
 
-Within Actio the day whitelist is `(None,) + WEEK_DAYS`, and **the leading `None` is the
-one deliberate divergence from `tcat`'s `-A -P`.** Actio's seven `**weekday**` markers are
-an *optional* second pass: a week is planned by listing tasks under the heading, and only
-some of them ever get allocated to a named day.
+What survives is the **day ladder**, and only to answer one question: was a task
+allocated to a day at or after the anchor? `weekly_mode(until)` returns
+`{'skip_days': WEEK_DAYS[idx:]}` and nothing else; with no anchor it returns `{}`.
+`MARK_RE` sets `cur_day` when a bold line names a weekday, any heading resets it, and a
+task under no marker is never dropped — most of a week being planned is unallocated,
+and an unallocated task has no day to be late for.
 
-Measured on this vault: an **organised** week allocates everything — W30 and W32 have zero
-tasks sitting at `day=None` — so on those the `None` entry matches nothing and the two
-tools agree exactly. A week still being **drafted** is the opposite: W33 has 37 unallocated
-tasks and not one allocated, so asking for `WEEK_DAYS` alone reports an empty plan against
-a full section. Reading the unallocated ones is what lets `tdiff` see a week you are still
-writing. This is not a `tcat` bug — `-A -P` is a retrospective view of a finished week, and
-that is a coherent thing to be.
+That last point used to be phrased as "the leading `None` in the whitelist is the one
+deliberate divergence from `tcat`'s `-A -P`", measured on this vault: an **organised**
+week (W30, W32) allocates every task to a marker, while a week still being **drafted**
+(W33) has 37 unallocated and none allocated. The measurement still holds and still
+explains why unallocated tasks must be read; there is simply no whitelist left for it
+to be a divergence *in*.
 
-`**future**` stays excluded — it is the deferral bucket, not this week — and the whitelist
-does that on its own, since `future` is simply not in the tuple. Daily notes inside a week
-aggregation exclude it too (`skip_future`), because folding seven days together would
-otherwise pull deferred work in beside what actually happened, and a pre-split Sunday's
-bucket holds a whole week of it. A **bare day side keeps its future bucket**: that is the
-day's own list, and deferring something is part of the day.
+`**future**` is no longer special anywhere. It was excluded twice over — absent from
+the day whitelist, and dropped by a `skip_future` flag on a week's dailies — and both
+hardcoded that a bucket by that name exists and what it means. A vault that calls it
+`### backlog`, or `### *futura*`, could reach neither. Naming it in `[exclude] sections`
+says it once, for whatever the vault actually writes.
+
+The behaviour this gives up is worth naming: a **bare day side used to keep its future
+bucket** while a week's dailies dropped it, on the reasoning that a pre-split Sunday's
+bucket holds a whole week of deferred work. One list cannot express a side-dependent
+rule, so a bucket named in the list is excluded everywhere and one left out is read
+everywhere. That is the vault's call to make, which is the point.
+
+**On this vault the change is a no-op**, which is the check that matters: with
+`sections = ["futura"]` in `~/.config/tdiff/config.toml`, 21 invocations across every
+shape the tool has are byte-identical to the whitelist implementation. One config line
+reproduces what `region='actio'` was doing — and now does it because the vault said so.
 
 ### How the three status filters compose
 
@@ -325,7 +369,9 @@ four. Three deliberate divergences remain, and none of them is drift:
   order an unlisted status the same way rather than merely both "last".
 
 Keys read: `[dedup] priority`, `[order] statuses`, `[roles] project|hide|settled`,
-`[vault] daily_folder|weekly_folder`. `[theme.*]` is `tcat`'s and is deliberately ignored
+`[exclude] sections`, `[vault] daily_folder|weekly_folder`. `[exclude]` is tdiff-only and
+lives in `config.example.toml`, not the shared status table — `tcat` has no reader to
+apply it to yet. `[theme.*]` is `tcat`'s and is deliberately ignored
 here — in `tdiff` the diff type owns the row colour, so a status colour would have nothing
 to paint. `[order]` used to be ignored for a weaker reason (rows just sorted by name) and
 is now read: it is the one display convention both tools genuinely share, and a `tdiff`
@@ -356,7 +402,7 @@ decides which status a row *carries*, `[order]` decides where that row *prints*.
 deduped to `[x]` therefore sorts to the bottom, which is the point of having two keys.
 
 `load_config()` populates `STATUS_PRIORITY`, `DISPLAY_ORDER`, `SETTLED_STATUSES`, `HIDDEN_STATUSES`,
-`PROJECT_STATUSES`, `DAILY_FOLDER`, `WEEKLY_FOLDER`, `CONFIG_FOUND` right after arg
+`PROJECT_STATUSES`, `EXCLUDED_SECTIONS`, `DAILY_FOLDER`, `WEEKLY_FOLDER`, `CONFIG_FOUND` right after arg
 parsing, before anything reads them. `DEFAULT_IGNORE` was renamed `SETTLED_STATUSES` to
 match the `[roles]` key it now comes from.
 
@@ -388,16 +434,19 @@ same thing about `[order]` in its own `report_unlisted()`.
 pinned commit here. Any change to them has to land in both tools together and the pin
 bumped, or the two will disagree about which note to read.
 
-`parse_note` (with `TASK_RE`, `H2_RE`, `H3_RE`, `MARK_RE`, `FENCE_RE`, `MDLINK_RE`,
-`WEEK_DAYS` and `LADDER`) joined that set when the reader was unified — it came *from*
+`parse_note` (with `TASK_RE`, `MARK_RE`, `HEAD_RE`, `BOLD_RE`, `FENCE_RE`,
+`MDLINK_RE` and `WEEK_DAYS`) joined that set when the reader was unified — it came *from*
 `tcat`, but `tdiff` is the canonical side. `check-core-sync.sh` now lists both it and
 `clean_text` in `FUNCS`, and passed at `PIN=92f195c`.
 
-**The fence fix breaks that, deliberately, and reconciling `tcat` is an open task.**
-`tdiff`'s `parse_note` now skips fenced blocks (see **Fenced blocks** above) and `tcat`'s
-copy does not, so once the pin is bumped past this commit the check reports `parse_note`
-DRIFTED. Landing it in `tcat` means the identical body plus `FENCE_RE` added to the
-script's `CONSTS` list. `tcat` was not touched here at the user's request — it had work in
+**The fence and section work breaks that, deliberately, and reconciling `tcat` is an
+open task.** `tdiff`'s `parse_note` skips fenced blocks and carries an outline and an
+exclude list; `tcat`'s does none of it, so once the pin is bumped past this commit the
+check reports `parse_note` DRIFTED. Landing it in `tcat` means the identical body, plus
+`FENCE_RE`, `HEAD_RE`, `BOLD_RE` and `OUTLINE_BOLD` in the script's `CONSTS` list,
+`_norm_heading` and `_excluded` in `FUNCS`, and a decision about where `tcat` reads its
+own exclude list from. `tcat` also loses `skip_future` in the move — its `-A` is the
+only caller. `tcat` was not touched here at the user's request — it had work in
 flight.
 
 `clean_text` was the earlier divergence and is now reconciled — the two copies are

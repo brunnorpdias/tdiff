@@ -1,8 +1,8 @@
 # tdiff-only settings.
 #
-# Install to ~/.config/tdiff/config.toml. Entirely optional: this file is an
-# *overlay* on statuses.example.toml (installed at
-# ~/.config/obsidian-tasks/statuses.toml), not a replacement for it.
+# Install to ~/.config/tdiff/config.toml. This file is an *overlay* on
+# statuses.example.toml (installed at ~/.config/obsidian-tasks/statuses.toml), not a
+# replacement for it. Nothing here is required.
 #
 # Layers, lowest precedence first — each merges over the ones below it, so a
 # partial file here never erases what the shared table set:
@@ -16,6 +16,35 @@
 # With none of them present tdiff exits with an error rather than guessing: without
 # [roles] project it would leak project headers into every diff, and without [dedup]
 # it would pick an arbitrary status for any task stated twice.
+
+
+[exclude]
+# Sections never read, in any note — daily or weekly. A section is a heading at any
+# level *or* a bold-only line, so "fixa", "actio fixa" and "actio > future" all name
+# something real; ">" separates outline ancestors, reading outward-in, and levels may
+# sit between them. A section runs until the next node at the same or shallower level,
+# and everything nested inside it goes with it.
+#
+# Emphasis, backticks and case are formatting, not name: "*Actio Fixa*", "**future**"
+# and "actio fixa" are all written here as bare lowercase words. That is the point —
+# move the bucket from **future** to ### backlog and only the word changes here.
+#
+# Fenced code blocks are skipped whatever this says, so a task list frozen inside one
+# needs no entry here. This list is for the rest — and it is the durable version of the
+# same idea, naming a section for what it is called rather than for how it happens to
+# be formatted. Nothing is special-cased by name, "future" included. --all ignores this
+# list for one run, and does not lift the fence.
+#
+# The list below is this vault's. "futura" is the weekly note's deferral section, an
+# H3 beside "### *Actio*"; naming it here is what keeps next week's plans out of this
+# week's diff, and dropping the line is how you ask to see them.
+sections = [
+  "fixa",
+  "actio fixa",
+  "futura",
+  "reflectio vespertina",
+  "previous daily log template",
+]
 
 
 [vault]
