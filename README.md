@@ -2,7 +2,7 @@
 
 Diff tasks between Obsidian daily notes.
 
-A single-file Python CLI that pulls tasks from your Obsidian daily notes (`<YYYY-MM-DD>`) and weekly notes (`YYYY-W##`) and reports what was added, removed, changed, or kept between two of them — grouped under the projects they belong to.
+A Python CLI that pulls tasks from your Obsidian daily notes (`<YYYY-MM-DD>`) and weekly notes (`YYYY-W##`) and reports what was added, removed, changed, or kept between two of them — grouped under the projects they belong to.
 
 File lookups are folder-agnostic: notes are resolved by filename anywhere in the vault (like an Obsidian wikilink), so `tdiff` doesn't care which folder your daily notes or weekly notes actually live in. See [Configuration](#configuration) if you ever need to pin explicit folders.
 
@@ -11,7 +11,7 @@ File lookups are folder-agnostic: notes are resolved by filename anywhere in the
 The flag surface was rebuilt around one idea: **a `w##` names a week, a date names a day, and a week has two sources you can narrow to.**
 
 1. **`-F` and `-o` are gone; `-W` is new.** A week is now read whole by default — `tdiff w23 w24` is what `tdiff w23 w24 -F` used to be. `-D` reads only that week's dailies, `-W` only its `YYYY-W##` weekly note, and naming neither reads both. `-o N` was sugar over naming both dates; write `tdiff -7 today` instead of `tdiff today -o -7`.
-2. **`-E` is gone.** It existed because `tdiff` couldn't read a weekly note's *Actio* section and `tcat` could. `tdiff` reads it now, so `-W` covers plan-vs-day directly.
+2. **`-E` is gone.** It existed because `tdiff` couldn't read a weekly note's plan section and `tcat` could. `tdiff` reads the whole note now, so `-W` covers plan-vs-day directly.
 3. **Projects are shown.** Tasks indented under a project header are grouped under it, and each project is its own dedup and diff scope — a task written both bare and under a project keeps a row in each.
 4. **`w0` means this week.** Weeks can now be named relative to the current one — `w0`, `w-1`, `w+1` — which is what `-o` was reaching for. `w0` previously fell through to the bare-number form and resolved to `YYYY-W00`, a label no calendar produces; nothing useful is lost.
 5. **A week derived from a date stops before that date.** `tdiff wednesday` compares Wednesday against Sunday–Tuesday, not against the whole week. Previously the later days leaked into the comparison; it only looked right for `today`, where the future is empty anyway.
@@ -23,25 +23,32 @@ The flag surface was rebuilt around one idea: **a `w##` names a week, a date nam
 
 ## Install
 
-Drop `tdiff` somewhere on your `$PATH`. It's executable (`#!/usr/bin/env python3`). Then install the status table:
+Drop `tdiff` somewhere on your `$PATH`. It's executable (`#!/usr/bin/env python3`). It reads the vault through [`tnotes`](https://github.com/brunnorpdias/tnotes), a module it shares with `tcat`, which goes in `~/.local/lib`:
 
 ```sh
-mkdir -p ~/.config/obsidian-tasks
-cp statuses.example.toml ~/.config/obsidian-tasks/statuses.toml
+mkdir -p ~/.local/lib ~/.config/tconfig
+ln -s "$PWD/../tnotes/tnotes.py" ~/.local/lib/tnotes.py
+cp ../tnotes/notation.example.toml ~/.config/tconfig/notation.toml
+cp ../tnotes/statuses.example.toml ~/.config/tconfig/statuses.toml
 ```
+
+Then edit `notation.toml` to match how you write your notes — which sections are not really task lists, how you mark a weekday. There is no install step and nothing is created for you.
 
 ## Configuration
 
 Task-status behaviour (dedup precedence, `-I`'s settled set, which statuses mark a project, the hidden set) is driven by TOML — not hardcoded in the script.
 
-The status table describes **your vault's notation**, not this tool, so it lives at `~/.config/obsidian-tasks/statuses.toml` — a directory neither `tdiff` nor `tcat` owns. Both read it, each ignoring what it has no use for, and neither needs the other installed. `tdiff` reads `[roles]`, `[dedup]`, `[order]` and `[vault]`; `tcat` reads `[order]`, `[roles]`, `[theme.*]` and `[vault]`. `[exclude]` is tdiff-only and lives in its own overlay.
+The config describes **your vault**, not this tool, so it lives in `~/.config/tconfig/` — a folder neither `tdiff` nor `tcat` owns. Both read it, each ignoring what it has no use for, and neither needs the other installed. It is split by concern rather than by tool, because that is the axis along which a file actually changes: `notation.toml` says how the vault *writes* things (`[exclude]`, `[days]`, `[vault]`), `statuses.toml` says what the statuses *mean* (`[order]`, `[dedup]`, `[roles]`, `[theme.*]`).
 
 **Layers**, lowest precedence first — each *merges* over the ones below, so a partial file never erases what a lower layer set:
 
-1. `~/.config/obsidian-tasks/statuses.toml` — the shared vault vocabulary
-2. `~/.config/tdiff/config.toml` — tdiff-only overlay (see [`config.example.toml`](config.example.toml))
-3. `$TDIFF_CONFIG`
-4. `--config PATH`
+1. `~/.config/tconfig/notation.toml` — how the vault writes things
+2. `~/.config/tconfig/statuses.toml` — what the statuses mean
+3. `~/.config/tconfig/tdiff.toml` — tdiff-only overrides (see [`tdiff.example.toml`](tdiff.example.toml))
+4. `$TDIFF_CONFIG`
+5. `--config PATH`
+
+`$TCONFIG_DIR` relocates the folder. If `tconfig/` holds none of these, the pre-`tconfig` layout — `~/.config/obsidian-tasks/statuses.toml` and `~/.config/tdiff/config.toml` — is read instead, with one notice naming the new home. That is a fallback for the first run after the move, not a layer: a `tconfig/` that exists wins outright.
 
 Nothing is ever bootstrapped. With none of these present `tdiff` exits with an error rather than guessing: without `[roles] project` it would leak project headers into every diff, and without `[dedup]` it would pick an arbitrary status for any task stated twice. Sections that are present but incomplete degrade with a note on stderr.
 
@@ -61,12 +68,21 @@ daily_folder = ""    # optional explicit folder prefix; empty = resolve by filen
 weekly_folder = ""
 
 [exclude]
-# Sections never read, in any note. A section is a heading at any level or a
-# bold-only line, and ">" separates outline ancestors. Emphasis and case are
-# ignored, so "*Actio Fixa*", "**future**" and "actio fixa" are all written as
-# bare words — move a bucket from **future** to ### backlog and only the word
-# changes here. Everything nested inside a named section goes with it.
-sections = ["fixa", "actio fixa", "futura"]
+# Headings never read, at any level, along with everything under them. ">"
+# separates ancestors, so "archive" names that heading anywhere and
+# "plan > deferred" only the one under "plan". Emphasis and case are ignored.
+# Headings only — bold text carries no level, so where such a section ends
+# would be a guess.
+sections = ["archive", "plan > deferred"]
+
+[days]
+# How your vault writes each weekday marker, as a glob matched against the whole
+# line. Read for one purpose: a week derived from a date drops tasks allocated to
+# that day or later. A list gives a day several spellings, which keeps your own
+# history readable after you change the notation. Omit the section and a weekly
+# note is never bounded by the date.
+monday = ["**monday**", "*|monday]]"]
+# ... and the other six
 ```
 
 ## Usage
@@ -121,8 +137,7 @@ tdiff today --json | jq .      # machine-readable output
 | `-S SET` / `--status SET` | Show only rows whose effective status is in a char set (e.g. `x-#`); prefix `^` to invert (e.g. `^x`) |
 | `-D` / `--dailies` | Read only a week's seven daily notes, not its weekly note |
 | `-W` / `--weekly` | Read only a week's `YYYY-W##` weekly note, not its dailies |
-| `--routines` | Include `#routine` tasks (excluded by default) |
-| `--all` | Ignore `[exclude] sections` for one run (fenced blocks are still skipped) |
+| `--all` | Ignore the whole `[exclude]` table — sections and tags alike — for one run (fenced blocks are still skipped) |
 | `--json` | Emit a JSON document instead of text (implies `--no-color`) |
 | `--config PATH` | Additional (merging) config layer, applied last |
 | `--no-color` | Disable colored output |
@@ -132,13 +147,13 @@ By default all types are shown, with `same` rows sorted after every other row. U
 
 ## Notes
 
-- Daily notes (`<YYYY-MM-DD>`) are resolved by filename anywhere in the vault via the `obsidian` CLI, which returns the note's raw markdown; `#routine` tasks are filtered out unless you pass `--routines`. Pin an explicit folder with `[vault] daily_folder` in the config file if name resolution ever becomes ambiguous.
+- Daily notes (`<YYYY-MM-DD>`) are resolved by filename anywhere in the vault via the `obsidian` CLI, which returns the note's raw markdown; task lines carrying a tag named in `[exclude] tags` are filtered out unless you pass `--all`. Pin an explicit folder with `[vault] daily_folder` in the config file if name resolution ever becomes ambiguous.
 - Weekly notes (`YYYY-W##`) resolve the same way (or via `[vault] weekly_folder`). Merged into a week, the weekly note loses dedup ties against any daily note in that week. Missing notes are silently ignored.
-- A weekly note is **read whole**, like a daily one. It used to be pinned to its `### *Actio*` section and to a whitelist of `**weekday**` markers, which decided for you where a plan lives — a plan parked in a sibling section (`### *futura*`) was then unreachable however you configured things. Name what you don't want in `[exclude] sections` instead.
-- The `**weekday**` markers are still read, for one purpose: a week derived from a date drops tasks allocated to that day or later. A task under no marker is never dropped — on a week you are still drafting that is usually all of them.
-- **Tasks inside a fenced code block are never read**, in any note. Fencing is how a task list gets frozen — a weekly note's *Fixa*, a daily's *Actio Fixa* — and a frozen copy of the week is not work of its own.
-- **`[exclude] sections` filters everything that isn't fenced.** Name a section and it is never read, along with everything nested inside it — the durable version of the same idea, since a section is skipped for what it is called rather than for how it happens to be formatted. Nothing is special-cased by name, `**future**` included: a vault that calls its deferral bucket `### backlog` says so in one word.
-- `--all` ignores the exclude list for one run. It does not lift the fence.
+- A weekly note is **read whole**, like a daily one. It used to be pinned to one heading and to a whitelist of day markers, both spelled into the script, which decided for you where a plan lives — a plan parked in a sibling section was unreachable however you configured things. Name what you don't want in `[exclude] sections` instead. No section name and no marker spelling appears anywhere in the script.
+- **Day markers come from `[days]`**, and are read for one purpose: a week derived from a date drops tasks allocated to that day or later. A task under no marker is never dropped — on a week you are still drafting that is usually all of them. With no `[days]` nothing opens a day, so a weekly note is never bounded by the date; the daily notes still truncate, since their bound is the filename.
+- **Tasks inside a fenced code block are never read**, in any note. Fencing is one way a task list gets frozen, and a frozen copy of the week is not work of its own.
+- **`[exclude] sections` filters everything that isn't fenced.** Name a heading and it is never read, along with everything under it — the durable version of the same idea, since a section is skipped for what it is called rather than for how it happens to be formatted. Nothing is special-cased by name.
+- `--all` ignores the whole `[exclude]` table for one run — sections and tags alike. It does not lift the fence.
 - **Projects group the output.** A task indented under a project header is shown beneath it, and each project is its own dedup and diff scope — scopes never merge, so a task written both bare and under a project keeps a row in each, and one that moves between projects reads as deleted from the first and added to the second. A project whose every row is filtered out prints no header. Project headers themselves are never rows — they don't count towards the summary's added/deleted/changed/same tallies, though the summary does report how many project headers were printed.
 - **Given one positional, it is compared against the week around it.** One rule underpins this: a positional is never compared against itself, so it leaves the week built around it. A date drops out of the dailies; a `w##` drops out as the weekly note, which leaves exactly the two sources, one per side — and is why a lone `w##` rejects `-D`/`-W`, since either would empty a side.
 - **A week derived from a date stops strictly before it**, on both sources: the dailies run Sunday→date−1, and the weekly note drops tasks allocated to that day or later. Nothing dated after a day can be outstanding as of it. A `w##` has no date to stop at, so its week is read whole.
@@ -153,7 +168,7 @@ By default all types are shown, with `same` rows sorted after every other row. U
 
 ### Task statuses
 
-Each task carries a single-character status (the `[ ]` marker in Obsidian). These are the characters `-S` and `-I` operate on. The table below reflects the shipped `statuses.example.toml` — all of it (dedup precedence, the role sets, and which chars exist at all) is configurable; see [Configuration](#configuration).
+Each task carries a single-character status (the `[ ]` marker in Obsidian). These are the characters `-S` and `-I` operate on. The table below reflects the shipped `statuses.example.toml` (in the `tnotes` repo) — all of it (dedup precedence, the role sets, and which chars exist at all) is configurable; see [Configuration](#configuration).
 
 | Status | Meaning | Notes |
 | --- | --- | --- |
