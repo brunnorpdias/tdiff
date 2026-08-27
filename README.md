@@ -32,13 +32,13 @@ cp ../tnotes/notation.example.toml ~/.config/tconfig/notation.toml
 cp ../tnotes/statuses.example.toml ~/.config/tconfig/statuses.toml
 ```
 
-Then edit `notation.toml` to match how you write your notes — which sections are not really task lists, how you mark a weekday. There is no install step and nothing is created for you.
+Then edit `notation.toml` to match how you write your notes — which sections are not really task lists, how you mark a weekday, which character cuts a comment off a task name. There is no install step and nothing is created for you.
 
 ## Configuration
 
 Task-status behaviour (dedup precedence, `-I`'s settled set, which statuses mark a project, the hidden set) is driven by TOML — not hardcoded in the script.
 
-The config describes **your vault**, not this tool, so it lives in `~/.config/tconfig/` — a folder neither `tdiff` nor `tcat` owns. Both read it, each ignoring what it has no use for, and neither needs the other installed. It is split by concern rather than by tool, because that is the axis along which a file actually changes: `notation.toml` says how the vault *writes* things (`[exclude]`, `[days]`, `[vault]`), `statuses.toml` says what the statuses *mean* (`[order]`, `[dedup]`, `[roles]`, `[theme.*]`).
+The config describes **your vault**, not this tool, so it lives in `~/.config/tconfig/` — a folder neither `tdiff` nor `tcat` owns. Both read it, each ignoring what it has no use for, and neither needs the other installed. It is split by concern rather than by tool, because that is the axis along which a file actually changes: `notation.toml` says how the vault *writes* things (`[exclude]`, `[days]`, `[comment]`, `[vault]`), `statuses.toml` says what the statuses *mean* (`[order]`, `[dedup]`, `[roles]`, `[theme.*]`).
 
 **Layers**, lowest precedence first — each *merges* over the ones below, so a partial file never erases what a lower layer set:
 
@@ -76,13 +76,24 @@ weekly_folder = ""
 sections = ["archive", "plan > deferred"]
 
 [days]
-# How your vault writes each weekday marker, as a glob matched against the whole
-# line. Read for one purpose: a week derived from a date drops tasks allocated to
-# that day or later. A list gives a day several spellings, which keeps your own
-# history readable after you change the notation. Omit the section and a weekly
-# note is never bounded by the date.
-monday = ["**monday**", "*|monday]]"]
+# How your vault writes each weekday marker, as a **literal** matched against the
+# whole line — anchored, so the marker must be alone on it. Nothing is a wildcard:
+# asterisks, brackets and pipes mean themselves. `{date}` is the one placeholder
+# and stands for an ISO date. Read for one purpose: a week derived from a date
+# drops tasks allocated to that day or later. A list gives a day several spellings,
+# which keeps your own history readable after you change the notation. Omit the
+# section and a weekly note is never bounded by the date.
+monday = ["**monday**", "[[{date}|monday]]"]
 # ... and the other six
+
+[comment]
+# Characters that cut a trailing comment off a task name, so
+#   - [ ] do blood screening – will complete saturday
+# is the task `do blood screening`. Only counts between spaces and outside every
+# bracket and parenthesis, so a linked title keeps its own dashes. Name only what
+# your vault uses as notation: listing the ASCII hyphen alongside the en dash will
+# truncate names that were only ever prose. Omit it and nothing is stripped.
+separators = ["–"]
 ```
 
 ## Usage
@@ -151,6 +162,7 @@ By default all types are shown, with `same` rows sorted after every other row. U
 - Weekly notes (`YYYY-W##`) resolve the same way (or via `[vault] weekly_folder`). Merged into a week, the weekly note loses dedup ties against any daily note in that week. Missing notes are silently ignored.
 - A weekly note is **read whole**, like a daily one. It used to be pinned to one heading and to a whitelist of day markers, both spelled into the script, which decided for you where a plan lives — a plan parked in a sibling section was unreachable however you configured things. Name what you don't want in `[exclude] sections` instead. No section name and no marker spelling appears anywhere in the script.
 - **Day markers come from `[days]`**, and are read for one purpose: a week derived from a date drops tasks allocated to that day or later. A task under no marker is never dropped — on a week you are still drafting that is usually all of them. With no `[days]` nothing opens a day, so a weekly note is never bounded by the date; the daily notes still truncate, since their bound is the filename.
+- **A marker is matched exactly and must be alone on its line, and markers are only ever looked for in weekly notes.** A task or a comment that happens to mention a weekday is not a marker. A daily note carries its date in its filename, so a marker found there could only be a false one. `[days]` values used to be globs, where `**saturday**` meant *any line containing "saturday"* — 394 false matches against 172 real markers in this vault, and 22 task lines swallowed whole because the marker test ran before the task test. Both are fixed; `{date}` is now the entire wildcard vocabulary.
 - **Tasks inside a fenced code block are never read**, in any note. Fencing is one way a task list gets frozen, and a frozen copy of the week is not work of its own.
 - **`[exclude] sections` filters everything that isn't fenced.** Name a heading and it is never read, along with everything under it — the durable version of the same idea, since a section is skipped for what it is called rather than for how it happens to be formatted. Nothing is special-cased by name.
 - `--all` ignores the whole `[exclude]` table for one run — sections and tags alike. It does not lift the fence.
@@ -163,7 +175,7 @@ By default all types are shown, with `same` rows sorted after every other row. U
 - `-S` filters on each row's **effective status** — the status actually shown in the row (`B`'s status for added/changed/same rows, `A`'s status for deleted rows). The summary line's counts (and total) reflect whatever `-S`, `-T`, and `-I` leave visible. A leading `^` inverts the whole set (`-S ^x` = everything except done). It composes with the `-T` type filter and with `-I`. Note: a bare `-S -` (only cancelled) looks like a flag to the parser — write it as `-S=-` or fold it into a set (`-S 'x-'`).
 - `-I` hides any row whose effective status is in `[roles] settled`, whichever side it came from — a task finished on B is as settled as one finished on A, so `++ [x]` and `~~ [/] → [x]` go too.
 - Three filters compose under one rule, the same one `tcat` uses: **a positive `-S` wins outright for the statuses it names.** So `-S '»'` shows postponed rows even though `[roles] hide` lists them, and `-I -S x` shows done rows rather than nothing. A negated `-S` only says what to drop, so `hide` and `-I` still apply to everything it doesn't name.
-- Section suffixes (`task name - section`) are stripped before comparison so the same task under different daily sections still matches — but only when the dash is outside `[[...]]`, so a wikilink whose title contains a dash keeps it.
+- **Trailing comments (`task name – a note about it`) are stripped before comparison**, so the same task annotated differently on two days still matches. Which characters count is yours to set in `[comment] separators`; the separator only counts between spaces and outside every bracket *and* parenthesis, so a linked title keeps its own dashes. Name nothing and nothing is stripped. This was hardcoded to take the ASCII hyphen along with the dashes, which truncated 30 names in this vault that were only ever prose.
 - Week aggregation uses **US Sun-Sat**, not ISO Mon-Sun. A week is labelled by the year it *ends* in: week 1 is the week containing Jan 1, so Sun 2026-12-27 → Sat 2027-01-02 is `2027-W01`, matching the vault templates' moment `gggg[-W]ww`. Only the week straddling New Year is ever affected.
 - In the one-positional form the earlier side goes on the left, so the diff reads as "what came before that the anchor doesn't have". With two positionals the order you wrote them is the order you get.
 
@@ -197,13 +209,14 @@ Dedup priority (highest wins when the same task appears with different statuses)
 
 A single unified predicate decides whether two task strings refer to the same logical task. It's used everywhere — within a note, and across the notes of a week aggregation.
 
-Two tasks merge if **any** of these holds (after link and trailing-punctuation normalization):
+**Two tasks are the same task iff their names are identical after normalisation, ignoring case.** There is no similarity metric anywhere in the tool.
 
-1. Their token sets are identical (e.g. `derivables..` vs `derivables`).
-2. One token set is a strict subset of the other AND they share the same first word (e.g. `start imperial application` vs `start new imperial application`).
+That is a deliberate reversal. Dedup used to merge two names whose token sets were equal, or where one was a strict subset sharing a first word; the diff had a second pass that relabelled close add/delete pairs as `changed` using Jaccard and prefix similarity at 0.7. Both guessed wrong often enough to matter — `purchase coffee` swallowed `purchase new coffee grinder`, `create new plan (3/8)` was matched to `(5/8)` — and no threshold separates the bad merges from the good ones, which are structurally identical. Exact matching costs **+1.4% rows** across 158 measured runs and buys a tool that never claims two tasks are one. A task you reworded now reads as deleted and added, which is what actually happened to the note.
 
 Names are normalised first: Obsidian's `\[` escapes are undone, a trailing ` – section` suffix is dropped *while the brackets are still there* (so `[[a title – with a dash]]` survives intact), wikilinks keep their brackets and lose only their folder path (`[[01 Daily/2026-05-03|alias]]` → `[[2026-05-03|alias]]`), and markdown links reduce to their display text (`[label](https://…)` → `label`).
 
-This is currently the one place `tdiff` and `tcat` disagree: `tcat` reduces a wikilink to its display text and strips the suffix afterwards, which truncates any linked title containing a dash. `tdiff` is the correct side; `tcat` will be reconciled to it.
+`tdiff` and `tcat` share one copy of all of this, in `tnotes`, so they cannot disagree about it.
 
-When a cluster forms, the **canonical name** is the most recent day's wording (tie-break: longest), and the **winning status** is the highest `STATUS_PRIORITY` across the cluster (`x` > `-` > `!`/`*`/`#`/` ` > `/` > intra-day markers); status ties resolve to the latest day. The cross-note diff still uses Jaccard/prefix fuzzy matching at threshold 0.7 to label renamed tasks as "changed" rather than "added"+"deleted".
+When a cluster forms, the **canonical name** is the most recent day's wording (tie-break: longest) — which, since the cluster members differ only in case, is really a choice of spelling — and the **winning status** is the highest `STATUS_PRIORITY` across the cluster (`x` > `-` > `!`/`*`/`#`/` ` > `/` > intra-day markers); status ties resolve to the latest day. Case is folded because a vault spells a wikilink both ways (25 names here differ only by case) and project scope keys have always been lowercased.
+
+A `changed` row therefore means exactly one thing: **same name, different status.**

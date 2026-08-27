@@ -16,9 +16,6 @@ except ImportError:
     raise SystemExit(2)
 tn.init('tdiff')
 
-JACCARD_THRESHOLD = 0.7
-PREFIX_THRESHOLD  = 0.7
-
 # Set from --all once args are parsed; read by _parse_obsidian() at call time.
 SHOW_ALL = False
 
@@ -64,13 +61,21 @@ def weekly_mode(until=None, only_anchor=False):
     This was invisible until [days] worked. The old matcher took `**monday**` and not
     the wikilink form, so no day ever opened and the weekly note contributed its whole
     plan whatever the anchor — which looked correct for exactly the wrong reason.
+
+    Day markers are supplied *here*, and only here. They used to ride on every
+    parse_note call, daily notes included, where a marker cannot mean anything: a
+    daily note carries its date in its filename and nothing inside it allocates a day.
+    All that bought was 240 false matches in this vault's dailies — and, before the
+    patterns were tightened, tasks eaten by them.
     """
     if until is None:
-        return {}
+        return {'day_patterns': tn.DAY_PATTERNS}
     idx = (date.fromisoformat(until).weekday() + 1) % 7
     if only_anchor:
-        return {'only_days': (tn.WEEK_DAYS[idx],)}
-    return {'skip_days': tn.WEEK_DAYS[idx + 1:]}
+        return {'day_patterns': tn.DAY_PATTERNS,
+                'only_days': (tn.WEEK_DAYS[idx],)}
+    return {'day_patterns': tn.DAY_PATTERNS,
+            'skip_days': tn.WEEK_DAYS[idx + 1:]}
 
 def _parse_obsidian(file_path, day_index, read_kwargs):
     """Yield (scope_key, scope_name, status, base, status_char, day_index) records.
@@ -92,7 +97,7 @@ def _parse_obsidian(file_path, day_index, read_kwargs):
             tn.obsidian_lines(file_path),
             exclude=() if SHOW_ALL else tn.EXCLUDED_SECTIONS,
             exclude_tags=() if SHOW_ALL else tn.EXCLUDED_TAGS,
-            day_patterns=tn.DAY_PATTERNS, **read_kwargs):
+            **read_kwargs):
         base = name
         if indent == 0:
             if status_char in tn.PROJECT_STATUSES:
@@ -167,52 +172,6 @@ def fetch_side(side):
     scopes = {k: headers[k] + tn.materialize(tn.cluster_records(v))
               for k, v in buckets.items()}
     return scopes, order
-
-def _tokenset(s):
-    return set(s.lower().split())
-
-def jaccard(sa, sb):
-    if not sa and not sb:
-        return 1.0
-    overlap = len(sa & sb)
-    return overlap / (len(sa) + len(sb) - overlap)
-
-def prefix_sim(a, b):
-    prefix_len = 0
-    for ca, cb in zip(a.lower(), b.lower()):
-        if ca != cb:
-            break
-        prefix_len += 1
-    return (2 * prefix_len) / (len(a) + len(b))
-
-def best_match(name, candidates):
-    """Closest candidate above the similarity threshold, or None.
-    `candidates` is a list of (name, tokenset) pairs; ties go to the earlier one."""
-    na, la = _tokenset(name), len(name)
-    first_char = name[:1].lower()
-    best, best_score = None, 0
-    for c, nc in candidates:
-        # Neither metric can reach the threshold when the shorter side is too small.
-        # Once a match exists, candidates that can only tie it cannot replace it.
-        token_ceiling = (min(len(na), len(nc)) / max(len(na), len(nc))
-                         if na or nc else 1.0)
-        same_first = c[:1].lower() == first_char
-        prefix_ceiling = (2 * min(la, len(c)) / (la + len(c))) if same_first else 0.0
-        ceiling = max(token_ceiling, prefix_ceiling)
-        if ceiling < JACCARD_THRESHOLD or ceiling <= best_score:
-            continue
-
-        score = jaccard(na, nc)
-        # Prefix similarity can only change the outcome when its length-based ceiling
-        # beats both this pair's Jaccard score and the running best.
-        if same_first:
-            if prefix_ceiling > max(score, best_score):
-                score = max(score, prefix_sim(name, c))
-        if score > best_score:
-            best, best_score = c, score
-    if best and best_score >= JACCARD_THRESHOLD:
-        return best
-    return None
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -463,10 +422,10 @@ b_scopes, b_order = fetch_side(side_b)
 # Types: 0=deleted, 1=added, 2=changed, 3=same
 # Rows are (scope_key, name, type, row_dict); row_dict is both the JSON record and what
 # render() turns into a text line, so the two output modes can't drift apart.
-#   name        canonical task name (A's for deleted/changed, B's for added)
+#   name        canonical task name — B's spelling for added/changed/same, A's for
+#               deleted, since matching folds case and the two sides may differ in it
 #   status      effective status char — B's for added/changed/same, A's for deleted
 #   old_status  A's status char (changed rows only)
-#   new_name    B's name (changed rows only, and only when the fuzzy match renamed it)
 #   project     the project the row sits under; absent on a bare row
 TYPE_NAMES = {0: 'deleted', 1: 'added', 2: 'changed', 3: 'same'}
 
@@ -475,12 +434,10 @@ TYPE_NAMES = {0: 'deleted', 1: 'added', 2: 'changed', 3: 'same'}
 PROJECTS = {k: v[:2] for k, v in a_scopes.items() if k is not None}
 PROJECTS.update({k: v[:2] for k, v in b_scopes.items() if k is not None})
 
-def row(scope, typ, name, status, old_status=None, new_name=None):
+def row(scope, typ, name, status, old_status=None):
     r = {'type': TYPE_NAMES[typ], 'name': name, 'status': status}
     if old_status is not None:
         r['old_status'] = old_status
-    if new_name is not None:
-        r['new_name'] = new_name
     if scope is not None:
         r['project'] = PROJECTS[scope][0]
     return (scope, name, typ, r)
@@ -494,53 +451,56 @@ def render(r, indent=''):
         return f"{RED}{indent}-- {st}  {r['name']}{RESET}"
     if typ == 'added':
         return f"{GREEN}{indent}++ {st}  {r['name']}{RESET}"
+    # A changed row is now always one name and two statuses: matching is exact, so
+    # there is no renamed form to print.
     old = f"[{r['old_status']}]"
-    if 'new_name' in r:
-        return f"{YELLOW}{indent}~~ {old} {r['name']} → {st} {r['new_name']}{RESET}"
     return f"{YELLOW}{indent}~~ {old} → {st}  {r['name']}{RESET}"
 
 def diff_scope(scope, a_tasks, a_order, b_tasks, b_order):
     """Diff one project's tasks against the other side's copy of that project.
 
-    Scopes are diffed independently and fuzzy matching never crosses one, so a task
-    that moved between projects reads as deleted there and added here rather than
-    silently staying put. A scope only one side has yields all-deleted or all-added,
-    which is how a project appearing or disappearing shows up at all.
+    **A task is the same task iff its name is the same, ignoring case.** There is no
+    second pass and no similarity metric. Jaccard plus prefix similarity at 0.7 used
+    to relabel close add/delete pairs as `changed`, and over four months of this vault
+    it produced 13 prefix-driven pairs of which 7 were wrong — `create new plan (3/8)`
+    matched to `(5/8)`, `omarchy quattro improvements: fix gpu crash` to `fix font
+    size`. Every wrong pair had the same shape: two names with *differing tails*, and
+    the tail was the whole of what distinguished them. Rather than encode that as one
+    more rule, the guessing went. It cost +1.5% rows across 141 runs.
+
+    So `changed` now means exactly one thing: same name, different status. A task that
+    was reworded reads as deleted and added, which is the honest report — the note did
+    change — and `new_name` no longer appears on any row.
+
+    Case is folded because dedup and scope keys already fold it (25 names in this vault
+    differ only by case), and a tool that called `[[2026-W34]]` and `[[2026-w34]]` two
+    tasks in one place and one task in another would be wrong somewhere.
+
+    Scopes are diffed independently, so a task that moved between projects reads as
+    deleted there and added here rather than silently staying put. A scope only one
+    side has yields all-deleted or all-added, which is how a project appearing or
+    disappearing shows up at all.
     """
     rows = []
-    a_names, b_names = set(a_tasks), set(b_tasks)
-    used_a, used_b = set(), set()
+    # Fold once, keeping each side's own spelling: the row's name comes from the side
+    # that owns it — B's for added/changed/same, A's for deleted — which is the rule
+    # the effective status already follows.
+    a_by = {n.casefold(): n for n in a_order}
+    b_by = {n.casefold(): n for n in b_order}
 
-    # Pass 1: exact name matches
-    for name in a_names & b_names:
-        used_a.add(name)
-        used_b.add(name)
-        if a_tasks[name] != b_tasks[name]:
-            rows.append(row(scope, 2, name, b_tasks[name][1],
-                            old_status=a_tasks[name][1]))
-        else:
-            rows.append(row(scope, 3, name, a_tasks[name][1]))
-
-    # Pass 2: fuzzy match remaining
-    remaining_a = [n for n in a_order if n not in used_a]
-    remaining_b = [n for n in b_order if n not in used_b]
-    # Candidates carry their token sets so pass 2 tokenizes each name once, not once
-    # per comparison; matched entries are dropped instead of re-filtered every round.
-    candidates = [(n, _tokenset(n)) for n in remaining_b]
-
-    for a_name in remaining_a:
-        match = best_match(a_name, candidates)
-        if match:
-            used_b.add(match)
-            candidates = [pair for pair in candidates if pair[0] != match]
-            rows.append(row(scope, 2, a_name, b_tasks[match][1],
-                            old_status=a_tasks[a_name][1],
-                            new_name=match if match != a_name else None))
-        else:
+    for key in a_by:
+        a_name = a_by[key]
+        b_name = b_by.get(key)
+        if b_name is None:
             rows.append(row(scope, 0, a_name, a_tasks[a_name][1]))
+        elif a_tasks[a_name] != b_tasks[b_name]:
+            rows.append(row(scope, 2, b_name, b_tasks[b_name][1],
+                            old_status=a_tasks[a_name][1]))
+        else:
+            rows.append(row(scope, 3, b_name, b_tasks[b_name][1]))
 
-    for b_name in remaining_b:
-        if b_name not in used_b:
+    for key, b_name in b_by.items():
+        if key not in a_by:
             rows.append(row(scope, 1, b_name, b_tasks[b_name][1]))
     return rows
 

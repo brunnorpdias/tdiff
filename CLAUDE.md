@@ -149,18 +149,55 @@ The script processes tasks in this pipeline:
    with them: which lines are day markers now comes from `[days]`, matched by
    `_match_day`.
 
+   **A task line is never a day marker.** `parse_note` tests `TASK_RE` first and only
+   asks `_match_day` about a line that is not a task. The order is load-bearing and it
+   is the whole of the bug that prompted this: with the marker test first,
+   `- [ ] do blood screening – will complete saturday or next week` was consumed as a
+   marker and never yielded, so the entire `personal health` scope vanished from that
+   side and every task in it read as `deleted`. 22 tasks were lost that way across this
+   vault, silently — a swallowed line leaves no trace in the output.
+
+   **And a marker is matched exactly, alone on the line, in weekly notes only.** See
+   **Reading the weekly note**.
+
    **Project grouping happens here, per note.** A task at indent 0 whose status is in `[roles] project` opens a scope and is not itself yielded; indented tasks join it; any other indent-0 task closes it and joins the bare scope (`scope_key = None`). Doing it inside the per-note loop is not incidental: a week side concatenates eight notes, and a header left open at the end of one would otherwise adopt the next note's children. `tcat`'s `build_groups` never faces that, seeing one note at a time.
 
    **How a note is read travels with it** as parse kwargs in `side_entries()`, because what a note means depends on which side asked for it, not on its name. `DAY_MODE` reads a whole daily note, and one inside a week aggregation too — identically, because dropping `**future**` there hardcoded both that such a bucket exists and what it means; `weekly_mode(until)` reads a `YYYY-W##` note whole too, adding only the anchor's day bound. See **Reading the weekly note** below.
 
-3. **Deduplicate** — `cluster_records()` uses union-find to merge task variants across days. Two bases are the same task if their token sets are identical OR one is a strict subset sharing the same first word. Rather than scanning all pairs, it buckets bases by token-set (equality merges) and by first token (subset merges) — same clusters, far fewer comparisons. `materialize()` picks the canonical form (most recent day, longest on tie) and winning status by `STATUS_PRIORITY`, which comes from `[dedup].priority` in the config.
+3. **Deduplicate** — `cluster_records()` groups records by name, **case-folded, and nothing else**. `materialize()` picks the canonical form (most recent day, longest on tie) and winning status by `STATUS_PRIORITY`, which comes from `[dedup].priority` in the config.
+
+   **This used to guess, and the guessing is gone.** Union-find merged two bases whose
+   token sets were equal, or where one was a strict subset sharing a first word. Over
+   this vault that made 221 merges, 56 of them with a two-token side, and among them
+   `purchase coffee` swallowing `purchase new coffee grinder`, `essay` swallowing
+   `essay planning`, `book london event` swallowing `book another london event`. No
+   threshold separates those from the routine merges they are structurally identical
+   to — `mind hygiene whoop` really is `mind hygiene weight-in whoop tea meditation`,
+   and a token-prefix rule that kills the first list kills 115 of the 221 including
+   most of the second. So the rule went instead of the tuning. Measured cost across 158
+   runs: **+1.4% rows**. What it buys is a tool that never claims two tasks are one.
+
+   Case is folded because the vault spells a wikilink both ways — 25 names differ only
+   by case — and scope keys have always been lowercased. Which *spelling* survives is
+   `materialize()`'s call, on the same most-recent-day rule as before.
 
    **Dedup is scoped.** It runs **once per project scope**, never once per side. Scopes never merge, exactly as in `tcat`: a task written both bare and under a project keeps a row in each, because the header is real context and a bare occurrence should not swallow a project's copy. `fetch_side()` returns `{scope_key: (display_name, header_status, tasks, order)}`. The invariant to hold onto is that scoping only ever *adds* rows.
 
 
 4. **Week aggregation** (`side_entries()` / `week_entries()`, materialized by `fetch_side()`) — a `('week', (sunday, anchor, want_dailies, want_weekly))` side reads up to 7 daily notes plus the `YYYY-W##` weekly note at `day_index=0` (lowest dedup priority among the 7 days — losing ties against any daily note). `want_dailies` / `want_weekly` come from `-D`/`-W`; `anchor` bounds the week: the dailies stop strictly before the date, the weekly note keeps that date's own allocation. Missing notes are silently skipped.
 
-5. **Diff** — `diff_scope()` runs **per project scope**, over the union of both sides' scopes. Pass 1 does exact name matching; Pass 2 uses `best_match()` with Jaccard and prefix similarity at 0.7 threshold to relabel close add/delete pairs as "changed". Candidates carry precomputed token sets, and the expensive `prefix_sim()` (difflib) is skipped whenever it cannot change the outcome — different first char, or a similarity ceiling below the running best. Fuzzy matching never crosses a scope, so a task that moved between projects reads as deleted from one and added to the other rather than silently staying put; a scope only one side has yields all-deleted or all-added, which is how a project appearing or disappearing shows up at all.
+5. **Diff** — `diff_scope()` runs **per project scope**, over the union of both sides' scopes. There is one pass: a task is the same task iff its name is the same, case-folded. A scope only one side has yields all-deleted or all-added, which is how a project appearing or disappearing shows up at all, and matching never crosses a scope, so a task that moved between projects reads as deleted from one and added to the other rather than silently staying put.
+
+   **`changed` therefore means exactly one thing: same name, different status.** Pass 2
+   used to relabel close add/delete pairs, and over four months of this vault it made 13
+   prefix-driven pairs of which **7 were wrong** — `create new plan (3/8)` matched to
+   `(5/8)`, `complete [[2026-W26]]` to `[[2026-W24]]`, `omarchy quattro improvements:
+   fix gpu crash` to `fix font size`. Every wrong pair had the same shape: two names
+   with *differing tails*, where the tail was the whole of what distinguished them.
+   Encoding that would have been one more rule to be subtly wrong about. A reworded
+   task now reads as `deleted` + `added`, which is the honest report — the note did
+   change. `jaccard`, `prefix_sim`, `best_match`, `_tokenset` and the two 0.7 thresholds
+   are all gone.
 
 6. **Output** — Project groups first, bare rows after. Projects sort by their own *header* status (`u` before `i` before `p`, from `[order].statuses`) and never by their children's — sorting a project by the statuses inside it would let one urgent task drag a whole project to the top. Rows inside a group go **type, then status, then name**: type outranks status because the question a diff answers is what moved, not what state it is in, and reading straight down the added block then the deleted block is the point of the tool. `TYPE_RANK` fixes that order as added, deleted, changed, same — the same order the summary line lists. Status orders within a type, which is where `[order].statuses` does its work; the lowercase name breaks the last tie. Coloured by diff type: deleted=RED, added=GREEN, changed=YELLOW, same=DIM; the project header is **uncoloured**, because the diff type belongs to the rows beneath it and a header dimmed to match nothing read as less structural than it is. A header prints only when a row under it survived the filters. Rows are built as dicts by `row()` and turned into text by `render()` at print time, so the text and `--json` modes are rendered from one source and can't drift. The summary line gains an `N projects` field, counting the headers that actually printed — it is text-only, since `--json` already names the project on every row.
 
@@ -256,27 +293,51 @@ marker spelling.
 
 What survives is the **day ladder**, and only to answer one question: was a task
 allocated to a day at or after the anchor? `weekly_mode(until)` returns
-`{'skip_days': WEEK_DAYS[idx + 1:]}` and nothing else; with no anchor it returns `{}`.
+`skip_days`/`only_days` and the day patterns, and nothing else.
 
-**`[days]` says what a marker looks like.** The keys are the seven canonical day names,
-because the code has to order them to know what "at or after" means; every value is a
-glob the vault supplies, matched by `_match_day` against the whole lowercased line. A
-day runs until the next marker or the next heading, and a task under no marker is never
-dropped — most of a week being planned is unallocated, and an unallocated task has no
-day to be late for.
+**Day markers are read in weekly notes and nowhere else.** `weekly_mode()` is the only
+thing that ever puts `day_patterns` in a note's parse kwargs; `DAY_MODE` is `{}`. A
+daily note carries its date in its filename and nothing inside it allocates a day, so a
+marker found there could only ever be a false one. Both tools used to pass the patterns
+on every call, which bought 240 false matches in this vault's dailies and — while the
+patterns were loose — tasks eaten by them.
 
-A value may be **a list of globs**, which is what makes a vault's own history readable
-after a notation change. This one is mid-migration: `2026-W32` writes `**tuesday**` and
-`2026-W35` writes `[[2026-08-25|tuesday]]`, so both spellings are listed and both weeks
-read. That is also how the ladder came to be silently dead — `MARK_RE` matched
-`**monday**` and nothing else, so the wikilink form scanned as ordinary text and every
-weekly note contributed its whole plan whatever the anchor.
+**`[days]` says what a marker looks like, and a marker is matched exactly.** The keys
+are the seven canonical day names, because the code has to order them to know what "at
+or after" means; every value is a **literal** the vault supplies, matched by
+`_match_day` against the whole stripped, lowercased line, anchored at both ends. So the
+marker must be alone on the line: `**monday** day` is not one, and neither is a comment
+or a task that mentions a weekday. A day runs until the next marker or the next
+heading, and a task under no marker is never dropped — most of a week being planned is
+unallocated, and an unallocated task has no day to be late for.
+
+**`{date}` is the entire wildcard vocabulary**, and stands for `\d{4}-\d{2}-\d{2}`.
+Everything else in a value is `re.escape`d and means itself. These were globs through
+`fnmatch` until the day-screening bug, and that is exactly where the bug came from:
+`**saturday**` is `*saturday*` to a glob, so it matched any line containing the word —
+394 false matches against 172 real markers. A pattern that names a marker has to match a
+marker and nothing else, and `*` cannot both be a wildcard and the asterisk in a bold
+marker. A value containing any other `{...}` earns a `notice()`, since a typo there
+would otherwise match nothing and bound nothing — silently, which is how the glob
+version survived for months.
+
+A value may be **a list of literals**, which is what makes a vault's own history
+readable after a notation change. This one is mid-migration: `2026-W32` writes
+`**tuesday**` and `2026-W35` writes `[[2026-08-25|tuesday]]`, so both spellings are
+listed and both weeks read. That is also how the ladder came to be silently dead —
+`MARK_RE` matched `**monday**` and nothing else, so the wikilink form scanned as
+ordinary text and every weekly note contributed its whole plan whatever the anchor.
 
 **With no `[days]` nothing ever opens a day**, so a weekly note is never bounded by the
 anchor. This is not an error and earns no notice: the daily notes still truncate, since
 their bound is the filename rather than anything inside them, and a vault that never
 allocates tasks to days has nothing to configure. It is worth knowing rather than
 guessing at, which is why it is written here.
+
+**A weekly note with no marker earns no notice either**, for the same reason: six of
+this vault's sixteen weekly notes allocate nothing to any day, and that is an ordinary
+week, not a broken config. The only `[days]` diagnostic is the placeholder typo above,
+which is a config error rather than a vault fact.
 
 `WEEK_DAYS` is the one thing left, and it is a list of days of the week, not a claim
 about notation. The old `LADDER` — `('promissum',) + WEEK_DAYS + ('future',)` — carried
@@ -309,7 +370,7 @@ a **dedup and diff scope**, not a decoration:
   each; the header is real context, and a bare occurrence should not swallow a project's
   copy. `--flat`-style collapsing does not exist here. The invariant that follows is that
   scoping only ever **adds** rows — a falling total is a bug, not a simplification.
-- **The diff runs per scope**, fuzzy pass 2 included. A task that moved between projects
+- **The diff runs per scope.** A task that moved between projects
   therefore reads as deleted from one and added to the other. That is the intended
   reading, not an artefact: the header is part of what the note said.
 - **A header is never a row.** It carries a project status, is not yielded by
@@ -347,6 +408,19 @@ which truncates any linked title containing a dash
 its display text where `tdiff` keeps the brackets, 115 of 455 names. `tdiff` was the
 correct side of both, which is why the shared copy is `tdiff`'s.
 
+**Which character is a separator is the vault's to say**, and comes from
+`[comment] separators`; `SEP_RE` is built from it and is `None` when the vault names
+none, in which case nothing is ever stripped. It was hardcoded as `' [-–—] '`, which
+took the ASCII hyphen a keyboard produces in ordinary prose alongside the en dash this
+vault actually writes as notation — 1812 en-dash cuts against 30 hyphen ones, and all
+30 of those truncated a name that was never a comment (`start reading papers -
+[[muhle-karbe-optimal-trading-amm.pdf|amm]]` became `start reading papers`). The em
+dash was accepted too and never once used.
+
+**Depth tracking counts parentheses as well as brackets.** A markdown link's URL sits
+*outside* bracket depth, so a separator there was unprotected; 186 names in this vault
+carry a separator inside a link and rely on this.
+
 ## Obsidian CLI stalls
 
 Roughly **one `obsidian` call in a few hundred wedges and never returns** — measured at 180s with no output, while sibling calls kept answering in ~10ms. It happens at the same rate reading serially or concurrently (1/480 at 1 worker, 2/480 at 4, 4/480 at 8), so it is not caused by tdiff's threading; concurrency only widens the window because week modes issue 16 calls instead of 2. This is why week modes appeared to hang while day-vs-day rarely did.
@@ -382,7 +456,7 @@ Diff mode:
     {"type": "added",   "name": "write thoughts", "status": "*"},
     {"type": "same",    "name": "pack luggage", "status": "x"},
     {"type": "changed", "name": "complete [[2026-W28]]", "status": "x",
-     "old_status": "x", "new_name": "complete [[2026-W29]]"},
+     "old_status": "/"},
     {"type": "added",   "name": "read luan's final report", "status": "!",
      "project": "[[forex fintech]]"}
   ],
@@ -391,7 +465,7 @@ Diff mode:
 ```
 
 - `status` is the *effective* status — B's for added/changed/same, A's for deleted — i.e. the one `-S` filters on and the one text mode prints.
-- `old_status` appears on `changed` rows only; `new_name` appears only when pass-2 fuzzy matching paired two differently-worded names.
+- `old_status` appears on `changed` rows only, and a `changed` row is always one name with two statuses — matching is exact, so there is no renamed form to report. `new_name` is gone with pass 2.
 - `project` names the project a row sits under, and is **absent** on a bare row. `rows` stays flat rather than nesting children the way `tcat`'s envelope does: the filters and the summary then need no shape of their own, and grouping stays purely a rendering concern. `tcat`'s nested form had exactly one consumer, `-E`, which is gone.
 - `files` lists the vault files actually read for that side. It is the only place `-D`/`-W`'s narrowing, the one-positional form's anchor-exclusion, and the anchor truncation are observable — none of them show up anywhere else in the output, which is what makes this field worth keeping.
 
@@ -417,7 +491,7 @@ mistake in config form.
 **Layers**, lowest precedence first — each *merges* over the ones below (`_merge()`:
 tables merge, lists replace wholesale):
 
-1. `~/.config/tconfig/notation.toml` — `[exclude]`, `[days]`, `[vault]`
+1. `~/.config/tconfig/notation.toml` — `[exclude]`, `[days]`, `[comment]`, `[vault]`
 2. `~/.config/tconfig/statuses.toml` — `[order]`, `[dedup]`, `[roles]`, `[theme.*]`
 3. `~/.config/tconfig/tdiff.toml` — tdiff-only overrides
 4. `$TDIFF_CONFIG`
@@ -445,7 +519,8 @@ reconciled the wrong way. A layer that exists but omits a section degrades with 
 `notice()` either way.
 
 Keys read: `[dedup] priority`, `[order] statuses`, `[roles] project|hide|settled`,
-`[exclude] sections|tags`, `[days] sunday..saturday`, `[vault] daily_folder|weekly_folder`.
+`[exclude] sections|tags`, `[days] sunday..saturday`, `[comment] separators`,
+`[vault] daily_folder|weekly_folder`.
 `[theme.*]` is `tcat`'s and is deliberately ignored here — in `tdiff` the diff type owns
 the row colour, so a status colour would have nothing to paint. The merged table is the
 superset and each tool reads what it has a use for. `[order]` used to be ignored for a
@@ -478,7 +553,7 @@ decides which status a row *carries*, `[order]` decides where that row *prints*.
 deduped to `[x]` therefore sorts to the bottom, which is the point of having two keys.
 
 `load_config()` populates `STATUS_PRIORITY`, `DISPLAY_ORDER`, `SETTLED_STATUSES`, `HIDDEN_STATUSES`,
-`PROJECT_STATUSES`, `EXCLUDED_SECTIONS`, `EXCLUDED_TAGS`, `DAY_PATTERNS`, `DAILY_FOLDER`, `WEEKLY_FOLDER`, `CONFIG_FOUND` right after arg
+`PROJECT_STATUSES`, `EXCLUDED_SECTIONS`, `EXCLUDED_TAGS`, `DAY_PATTERNS`, `SEP_RE`, `DAILY_FOLDER`, `WEEKLY_FOLDER`, `CONFIG_FOUND` right after arg
 parsing, before anything reads them. `DEFAULT_IGNORE` was renamed `SETTLED_STATUSES` to
 match the `[roles]` key it now comes from.
 
