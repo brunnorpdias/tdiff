@@ -64,7 +64,8 @@ the end), `parse_note` and `clean_text` drifted, and the check never covered
 status a deduped task carries and about what a missing config means. **The check script
 is deleted**; the drift it existed to catch cannot occur.
 
-What moved: name normalisation (`clean_text` and friends), `parse_note` and its
+What moved: name normalisation (`clean_text` and friends, plus the print-time
+`display_text`), `parse_note` and its
 regexes, the whole vault reader (`obsidian_lines`, `prefetch`, `die`, the stall
 handling), config loading, the date core, and `cluster_records`/`materialize`. What
 stayed: the diff itself, the week/side model, the filters, rendering, and argparse.
@@ -199,7 +200,7 @@ The script processes tasks in this pipeline:
    change. `jaccard`, `prefix_sim`, `best_match`, `_tokenset` and the two 0.7 thresholds
    are all gone.
 
-6. **Output** — Project groups first, bare rows after. Projects sort by their own *header* status (`u` before `i` before `p`, from `[order].statuses`) and never by their children's — sorting a project by the statuses inside it would let one urgent task drag a whole project to the top. Rows inside a group go **type, then status, then name**: type outranks status because the question a diff answers is what moved, not what state it is in, and reading straight down the added block then the deleted block is the point of the tool. `TYPE_RANK` fixes that order as added, deleted, changed, same — the same order the summary line lists. Status orders within a type, which is where `[order].statuses` does its work; the lowercase name breaks the last tie. Coloured by diff type: deleted=RED, added=GREEN, changed=YELLOW, same=DIM; the project header is **uncoloured**, because the diff type belongs to the rows beneath it and a header dimmed to match nothing read as less structural than it is. A header prints only when a row under it survived the filters. Rows are built as dicts by `row()` and turned into text by `render()` at print time, so the text and `--json` modes are rendered from one source and can't drift. The summary line gains an `N projects` field, counting the headers that actually printed — it is text-only, since `--json` already names the project on every row.
+6. **Output** — Project groups first, bare rows after. Projects sort by their own *header* status (`u` before `i` before `p`, from `[order].statuses`) and never by their children's — sorting a project by the statuses inside it would let one urgent task drag a whole project to the top. Rows inside a group go **type, then status, then name**: type outranks status because the question a diff answers is what moved, not what state it is in, and reading straight down the added block then the deleted block is the point of the tool. `TYPE_RANK` fixes that order as added, deleted, changed, same — the same order the summary line lists. Status orders within a type, which is where `[order].statuses` does its work; the lowercase name breaks the last tie. Coloured by diff type: deleted=RED, added=GREEN, changed=YELLOW, same=DIM; the project header is **uncoloured**, because the diff type belongs to the rows beneath it and a header dimmed to match nothing read as less structural than it is. A header prints only when a row under it survived the filters. Rows are built as dicts by `row()` and turned into text by `render()` at print time, so the text and `--json` modes are rendered from one source and can't drift. `render()` and the project-header line are also the only two places `tn.display_text` runs — collapsing an aliased wikilink to its alias is a *printing* step, and doing it any earlier would hand dedup a name two notes can share (see **Task names**). The summary line gains an `N projects` field, counting the headers that actually printed — it is text-only, since `--json` already names the project on every row.
 
 ## Key flags
 
@@ -384,8 +385,12 @@ a **dedup and diff scope**, not a decoration:
 One consequence worth knowing before it surprises you: a header that differs only by a
 wikilink anchor — `[[2026 master's applications#imperial]]` vs
 `[[2026 master's applications]]` — is **two** scopes, so its tasks read as deleted from
-one and added to the other. Nothing strips `#section` from a scope key. Whether it should
-is a vault-convention question, not a code one.
+one and added to the other. `clean_text` drops an anchor only where an alias replaces it
+(see **Task names**) and a project header is normally written bare, so nothing strips
+`#section` from a scope key. Narrowing this would mean teaching the scope key alone about
+anchors — not loosening the name rule, which would merge ordinary tasks that the anchor is
+the whole of the difference between. Whether the vault wants `#imperial` to be its own
+project is a convention question, not a code one.
 
 ## Task names
 
@@ -395,9 +400,30 @@ is a vault-convention question, not a code one.
    bracket depth at all;
 2. `strip_section_suffix` — drops a trailing ` – ...` **while the brackets are still
    there**, so its depth tracking can see that a dash inside `[[...]]` is part of a title;
-3. `normalize_wikilinks` — keeps the brackets, shortens only the path
-   (`[[a/b|c]]` → `[[b|c]]`);
+3. `normalize_wikilinks` — keeps the brackets, shortens the path (`[[a/b|c]]` → `[[b|c]]`)
+   and, **only where an alias stands in for it**, drops the anchor
+   (`[[2026-08-05#the decline of europe|europe decline]]` → `[[2026-08-05|europe decline]]`);
 4. `MDLINK_RE` — reduces `[label](url)` to `label`.
+
+**Rendering is a fifth step, and it happens at `print` time rather than here.**
+`tn.display_text` collapses an aliased wikilink to its alias in a *single* bracket —
+`[[…bodner ⟦book⟧.pdf|learning go (5/15) – functions]]` → `[learning go (5/15) –
+functions]` — and leaves an unaliased one exactly as it is. The alias is the vault
+already saying in its own words what the target is; the target beside it is the long
+half, routinely three times the alias, and a `w36` diff of a reading list was a wall of
+identical PDF filenames. One bracket rather than two because the printed text is no
+longer a link: pasted back into the vault it would resolve to a note named after the
+alias, or to nothing. A double bracket on screen therefore means the name really is the
+link.
+
+**It must never run before a `print`, and that is the whole of the discipline.** An
+alias is display text and two notes may share one — which is exactly why
+`normalize_wikilinks` keeps the target — so a name collapsed to its alias upstream of
+`cluster_records` or `diff_scope` would claim two tasks are one. `render()` and the
+project-header line call it in `tdiff`, `row()` calls it in `tcat`, and nothing else
+does; `--json` reports the canonical name, because a consumer wants the link target.
+Rows still *sort* by the canonical name, so a run of links sharing a target stays
+together on screen even though the shared half is no longer visible.
 
 **This once diverged from `tcat` on two counts.** Both are moot now — there is one
 copy, in `tnotes` — but the history is worth keeping because it says which side was
@@ -407,6 +433,27 @@ which truncates any linked title containing a dash
 455 names in this vault, some to a third of their length. And `tcat` reduced a wikilink to
 its display text where `tdiff` keeps the brackets, 115 of 455 names. `tdiff` was the
 correct side of both, which is why the shared copy is `tdiff`'s.
+
+**The anchor is dropped only when the link carries an alias, and that restriction is the
+whole of the rule.** With an alias the vault has already said in its own words what the
+anchor points at, so the heading is 32 characters of pure redundancy in a name that then
+spills past one line — 98 names shortened here, 1730 characters. Without an alias the
+anchor is the only thing the link says: `knowledge: [[calculus#multivariable]]` is not
+`knowledge: [[calculus#differential equations]]`, and `reflect on [[2026-04-14#commentarii]]`
+is not `reflect on [[2026-04-14#tranquillitas animi]]`. Stripping unconditionally merged
+**10** name pairs across this vault's 23728 task lines, which is dedup claiming two tasks
+are one — the exact failure the clustering rewrite exists to have removed. The target is
+kept rather than reduced to the alias for the same reason: an alias is display text and
+two notes may share one, while the target is what identifies the note, and identity is
+what dedup keys on. A bare `[[#heading]]` (445 here, a link within the same note) has no
+alias and is never touched.
+
+The visible win is a task whose anchor moves while the task does not: a reading list
+writes `[[…bodner ⟦book⟧.pdf#page=149|learning go (07/15) – types…]]` on Monday and
+`#page=167` on Tuesday, and before this that was a `deleted` plus an `added` — the
+page you stopped at reported as a different task. It now reads as `changed`. Row
+totals therefore *fall* slightly where a vault does this (one row per collapsed
+pair), which is the one sanctioned exception to the dedup-ordering check above.
 
 **Which character is a separator is the vault's to say**, and comes from
 `[comment] separators`; `SEP_RE` is built from it and is `None` when the vault names
@@ -464,6 +511,7 @@ Diff mode:
 }
 ```
 
+- `name` is the **canonical** name, target and all — `--json` never applies the alias collapsing text mode prints, because a consumer wants the link target.
 - `status` is the *effective* status — B's for added/changed/same, A's for deleted — i.e. the one `-S` filters on and the one text mode prints.
 - `old_status` appears on `changed` rows only, and a `changed` row is always one name with two statuses — matching is exact, so there is no renamed form to report. `new_name` is gone with pass 2.
 - `project` names the project a row sits under, and is **absent** on a bare row. `rows` stays flat rather than nesting children the way `tcat`'s envelope does: the filters and the summary then need no shape of their own, and grouping stays purely a rendering concern. `tcat`'s nested form had exactly one consumer, `-E`, which is gone.

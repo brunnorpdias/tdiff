@@ -443,18 +443,26 @@ def row(scope, typ, name, status, old_status=None):
     return (scope, name, typ, r)
 
 def render(r, indent=''):
+    """Turn one row dict into a text line.
+
+    `tn.display_text` runs *here* and nowhere earlier: it collapses an aliased wikilink
+    to its alias, which is a name two different notes may share, so a row carrying it
+    upstream of dedup or of `diff_scope` could claim two tasks are one. `--json` keeps
+    the canonical name for the same reason — a consumer wants the link target.
+    """
     st = f"[{r['status']}]"
+    name = tn.display_text(r['name'])
     typ = r['type']
     if typ == 'same':
-        return f"{DIM}{indent}== {st}  {r['name']}{RESET}"
+        return f"{DIM}{indent}== {st}  {name}{RESET}"
     if typ == 'deleted':
-        return f"{RED}{indent}-- {st}  {r['name']}{RESET}"
+        return f"{RED}{indent}-- {st}  {name}{RESET}"
     if typ == 'added':
-        return f"{GREEN}{indent}++ {st}  {r['name']}{RESET}"
+        return f"{GREEN}{indent}++ {st}  {name}{RESET}"
     # A changed row is now always one name and two statuses: matching is exact, so
     # there is no renamed form to print.
     old = f"[{r['old_status']}]"
-    return f"{YELLOW}{indent}~~ {old} → {st}  {r['name']}{RESET}"
+    return f"{YELLOW}{indent}~~ {old} → {st}  {name}{RESET}"
 
 def diff_scope(scope, a_tasks, a_order, b_tasks, b_order):
     """Diff one project's tasks against the other side's copy of that project.
@@ -579,6 +587,7 @@ for scope, r in kept:
     if scope != last_scope:
         if scope is not None:
             name, status = PROJECTS[scope]
+            name = tn.display_text(name)
             # Uncoloured on purpose: the diff type owns the row colours beneath it, and
             # a header dimmed to match nothing read as less structural than it is.
             print(f"[{status}] {name}")
